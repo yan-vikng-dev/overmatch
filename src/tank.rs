@@ -3,7 +3,8 @@
 //! (aim, shooting) attach their own behavior to these markers reactively.
 
 use avian3d::prelude::{
-    Collider, ColliderDensity, CollisionLayers, LayerMask, RayCaster, RigidBody, SpatialQueryFilter,
+    ColliderConstructor, ColliderConstructorHierarchy, ColliderDensity, CollisionLayers, LayerMask,
+    RayCaster, RigidBody, SpatialQueryFilter,
 };
 use bevy::prelude::*;
 use bevy::world_serialization::WorldInstanceReady;
@@ -11,15 +12,8 @@ use bevy::world_serialization::WorldInstanceReady;
 use crate::Layer;
 use crate::state::GameplaySet;
 
-// Hull collision box, metres. PLACEHOLDER Tiger-ish estimates — TUNE to the model's hull
-// bounding box (Bevy-local: X = width over tracks, Y = height ground→roof, Z = length).
-const HULL_WIDTH: f32 = 3.5;
-const HULL_HEIGHT: f32 = 1.4;
-const HULL_LENGTH: f32 = 6.3;
-/// Ground clearance of the hull belly (m): the box is raised by this so the roadwheels carry the
-/// tank on flat ground and the box only handles obstacle collisions (and bottoming-out).
-const HULL_BELLY: f32 = 0.4;
-/// Uniform density giving ~57 t (≈ Tiger I) at the current hull box. TUNE alongside the dims.
+/// Uniform density of the hull collider (kg/m³): roughly Tiger-I mass at the authored collision
+/// proxy's volume. PLACEHOLDER — mass is per-variant data (bucket 2), a later migration.
 const HULL_DENSITY: f32 = 1850.0;
 
 /// How far a suspension ray reaches from the hub (metres). Must exceed the effective radius
@@ -68,29 +62,49 @@ pub struct Roadwheel {
 #[derive(Component)]
 pub struct CenterOfMassAnchor;
 
-/// Travel limits for a [`Servo`].
-#[derive(Clone, Copy)]
-enum Travel {
+/// Travel limits for a [`ServoSpec`].
+#[derive(Clone, Copy, Reflect)]
+pub enum Travel {
     Limited { min: f32, max: f32 },
     Continuous,
 }
 
-/// A 1-DOF kinematic rotational motor with a trapezoidal motion profile. Aiming writes
-/// [`Servo::target`]; `drive_servos` slews `current` toward it and applies the rotation.
-#[derive(Component)]
-pub struct Servo {
+// A 1-DOF kinematic rotational motor (trapezoidal motion profile), split three ways so each
+// concern has one owner: per-variant config, the commanded intent, and the live mechanism state.
+// `drive_servos` is the behaviour; it reads spec + command and drives state + the transform.
+
+/// Servo config: rotation axis, speed/accel limits, travel range. Per-variant data (bucket 2);
+/// authored in code today, on the model via skein later (ADR-0007). `Reflect` so skein can.
+#[derive(Component, Reflect)]
+#[reflect(Component)]
+pub struct ServoSpec {
     axis: Vec3,
-    current: f32,
-    velocity: f32,
-    /// Desired angle, in the parent-local frame. Written by the aim feature.
-    pub target: f32,
     max_speed: f32,
     accel: f32,
     travel: Travel,
 }
 
+/// The commanded angle (parent-local) a servo slews toward — the *intent*, written by aiming
+/// (and, later, the ROADMAP Phase-2 controls layer). Position-mode for now; a velocity-mode
+/// command is a future variant (NOTES.md). Kept separate from state: different writer, different
+/// lifecycle.
+#[derive(Component, Default)]
+pub struct ServoCommand {
+    pub target: f32,
+}
+
+/// A servo's live mechanism state — current angle and angular velocity of the slew. Owned by
+/// `drive_servos`; never authored, never shared.
+#[derive(Component, Default)]
+pub struct ServoState {
+    current: f32,
+    velocity: f32,
+}
+
 pub fn plugin(app: &mut App) {
-    app.add_systems(Startup, spawn_tank)
+    app.register_type::<ServoSpec>()
+        .register_type::<Travel>()
+        .add_systems(Startup, spawn_tank)
         .add_systems(FixedUpdate, drive_servos.in_set(GameplaySet));
 }
 
@@ -101,21 +115,11 @@ fn spawn_tank(mut commands: Commands, asset_server: Res<AssetServer>) {
                 asset_server.load(GltfAssetLabel::Scene(0).from_asset("tiger_1/tiger_1.glb")),
             ),
             Transform::from_xyz(10.0, 2.0, 5.0).with_rotation(Quat::from_rotation_z(0.7)),
-            // The hull is a dynamic rigid body — Avian now owns its Transform (ADR-0005).
+            // The hull is a dynamic rigid body — Avian owns its Transform (ADR-0005). Its collider
+            // comes from the model's `*_Collider` convex proxy, bound in on_tank_ready (ADR-0008).
             Tank,
             RigidBody::Dynamic,
         ))
-        // Hull collider: an offset child box for the upper hull, raised by the belly clearance so
-        // the roadwheels (not this box) carry the tank on flat ground. Density sets the mass.
-        .with_children(|children| {
-            children.spawn((
-                Collider::cuboid(HULL_WIDTH, HULL_HEIGHT, HULL_LENGTH),
-                Transform::from_xyz(0.0, HULL_BELLY + HULL_HEIGHT / 2.0, 0.0),
-                // Vehicle layer — the wheel rays are filtered to skip this.
-                CollisionLayers::new([Layer::Vehicle], LayerMask::ALL),
-                ColliderDensity(HULL_DENSITY),
-            ));
-        })
         .observe(on_tank_ready);
 }
 
@@ -128,31 +132,29 @@ fn on_tank_ready(
 ) {
     for entity in children.iter_descendants(ready.entity) {
         // Most descendants are unnamed mesh nodes — skip them quietly.
-        let Ok(name) = names.get(entity) else { continue };
+        let Ok(name) = names.get(entity) else {
+            continue;
+        };
         let mut entity = commands.entity(entity);
         match name.as_str() {
             "Turret" => {
                 entity.insert((
                     Turret,
-                    Servo {
+                    ServoSpec {
                         axis: Vec3::Y,
-                        current: 0.0,
-                        velocity: 0.0,
-                        target: 0.0,
                         max_speed: 0.6,
                         accel: 0.3,
                         travel: Travel::Continuous,
                     },
+                    ServoCommand::default(),
+                    ServoState::default(),
                 ));
             }
             "Gun" => {
                 entity.insert((
                     Gun,
-                    Servo {
+                    ServoSpec {
                         axis: Vec3::X,
-                        current: 0.0,
-                        velocity: 0.0,
-                        target: 0.0,
                         max_speed: 0.4,
                         accel: 2.0,
                         travel: Travel::Limited {
@@ -160,6 +162,8 @@ fn on_tank_ready(
                             max: 15.0_f32.to_radians(),
                         },
                     },
+                    ServoCommand::default(),
+                    ServoState::default(),
                 ));
             }
             "Hull" => {
@@ -190,47 +194,63 @@ fn on_tank_ready(
                         .with_query_filter(SpatialQueryFilter::from_mask(Layer::Terrain)),
                 ));
             }
+            // Collision proxies (`*_Collider`, optionally split `_0/_1/...`): each becomes a
+            // convex-hull collider on the Vehicle layer — part of the compound rigid body — and is
+            // hidden, since it exists for physics, not rendering (ADR-0008). The glTF loader puts
+            // the mesh on a child primitive entity, so build over this node's descendants (the
+            // hierarchy constructor) rather than the node itself, which has no mesh handle.
+            s if s.contains("_Collider") => {
+                entity.insert((
+                    ColliderConstructorHierarchy::new(ColliderConstructor::ConvexHullFromMesh)
+                        .with_default_layers(CollisionLayers::new([Layer::Vehicle], LayerMask::ALL))
+                        .with_default_density(ColliderDensity(HULL_DENSITY)),
+                    Visibility::Hidden,
+                ));
+            }
             _ => {}
         }
     }
 }
 
-fn drive_servos(mut q: Query<(&mut Transform, &mut Servo)>, time: Res<Time>) {
+fn drive_servos(
+    mut q: Query<(&mut Transform, &ServoSpec, &ServoCommand, &mut ServoState)>,
+    time: Res<Time>,
+) {
     let dt = time.delta_secs();
-    for (mut transform, mut servo) in &mut q {
-        let prev = servo.current;
-        let error = match servo.travel {
-            Travel::Limited { .. } => servo.target - servo.current,
-            Travel::Continuous => shortest_angle(servo.target - servo.current),
+    for (mut transform, spec, command, mut state) in &mut q {
+        let prev = state.current;
+        let error = match spec.travel {
+            Travel::Limited { .. } => command.target - state.current,
+            Travel::Continuous => shortest_angle(command.target - state.current),
         };
-        let braking_dist = (servo.velocity * servo.velocity) / (2.0 * servo.accel);
+        let braking_dist = (state.velocity * state.velocity) / (2.0 * spec.accel);
 
         if error.abs() <= braking_dist {
-            let dv = servo.accel * dt;
-            servo.velocity = if servo.velocity > 0.0 {
-                (servo.velocity - dv).max(0.0)
+            let dv = spec.accel * dt;
+            state.velocity = if state.velocity > 0.0 {
+                (state.velocity - dv).max(0.0)
             } else {
-                (servo.velocity + dv).min(0.0)
+                (state.velocity + dv).min(0.0)
             };
         } else {
-            servo.velocity += error.signum() * servo.accel * dt;
-            servo.velocity = servo.velocity.clamp(-servo.max_speed, servo.max_speed);
+            state.velocity += error.signum() * spec.accel * dt;
+            state.velocity = state.velocity.clamp(-spec.max_speed, spec.max_speed);
         }
 
-        servo.current += servo.velocity * dt;
-        if let Travel::Limited { min, max } = servo.travel {
-            servo.current = servo.current.clamp(min, max);
+        state.current += state.velocity * dt;
+        if let Travel::Limited { min, max } = spec.travel {
+            state.current = state.current.clamp(min, max);
         }
 
-        if error.abs() < 0.001 && servo.velocity.abs() < 0.01 {
-            servo.velocity = 0.0;
-            if let Travel::Limited { min, max } = servo.travel {
-                servo.current = servo.target.clamp(min, max);
+        if error.abs() < 0.001 && state.velocity.abs() < 0.01 {
+            state.velocity = 0.0;
+            if let Travel::Limited { min, max } = spec.travel {
+                state.current = command.target.clamp(min, max);
             }
         }
 
-        let delta = servo.current - prev;
-        transform.rotate_local(Quat::from_axis_angle(servo.axis, delta));
+        let delta = state.current - prev;
+        transform.rotate_local(Quat::from_axis_angle(spec.axis, delta));
     }
 }
 

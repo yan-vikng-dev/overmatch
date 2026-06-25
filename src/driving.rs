@@ -4,6 +4,7 @@
 //! shape and a bottoming-out safety floor.
 
 use avian3d::prelude::*;
+use bevy::ecs::lifecycle::Add;
 use bevy::prelude::*;
 
 use crate::state::GameplaySet;
@@ -17,21 +18,58 @@ const STIFFNESS: f32 = 450_000.0;
 /// Suspension damping per wheel (N·s/m), ~0.6 of critical, so it settles without bouncing.
 const DAMPING: f32 = 50_000.0;
 
-/// Max thrust per roadwheel at full throttle (N); ×16 wheels = total tractive force.
-const MAX_THRUST: f32 = 12_500.0;
-/// Rolling resistance per wheel (N per m/s of forward speed) — bounds top speed.
-const ROLLING_RESISTANCE: f32 = 1_150.0;
-/// Lateral grip per wheel (N per m/s of side-slip) — resists side-slip and yaw (skid-steer).
-const LATERAL_GRIP: f32 = 60_000.0;
 /// Coulomb coefficient: each wheel's total ground force is capped at MU × load (friction circle).
+/// Per-environment (the track-vs-ground surface pair), not per-tank — destined for the terrain
+/// mechanic, not the model (ADR-0007, bucket 3).
 const MU: f32 = 0.9;
 /// Input ramp (per second): turns binary keys into a smooth throttle/steer signal — and gives
-/// the keyboard a taste of the analog mid-range on the way to full.
+/// the keyboard a taste of the analog mid-range on the way to full. Universal feel (bucket 1).
 const INPUT_RAMP: f32 = 4.0;
+/// Below this contact planar speed (m/s) a wheel "grips": it plants a brush anchor and holds
+/// statically instead of slipping. Above it, friction is kinetic (the skid / coast-down model).
+/// This static↔kinetic gate is a Karnopp-style zero-velocity band — what lets a stopped tank
+/// hold on a slope instead of creeping away. Universal feel (bucket 1).
+const STICK_SPEED: f32 = 0.3;
+/// A per-track command below this magnitude counts as "no drive" — the wheel holds rather than
+/// driving, so a feather-touch doesn't switch off the hill-hold. Universal feel (bucket 1).
+const COMMAND_DEADBAND: f32 = 0.02;
+
+/// Per-variant drivetrain characteristics — this tank's locomotion spec sheet, read by
+/// `apply_drive`. A code `Default` today (the tuned-by-feel placeholders); authored on the model
+/// via skein later (ADR-0007, bucket 2). `Reflect` so skein can instantiate it from glTF extras.
+#[derive(Component, Reflect)]
+#[reflect(Component, Default)]
+pub struct Drivetrain {
+    /// Max thrust per roadwheel at full throttle (N); ×16 wheels = total tractive force.
+    pub max_thrust: f32,
+    /// Longitudinal viscous term (N per m/s of forward speed): bounds top speed under thrust, and
+    /// — throttle released, still rolling — IS the engine-brake / coast-down (heavy-glide dial).
+    pub rolling_resistance: f32,
+    /// Lateral grip (N per m/s of side-slip), kinetic regime — resists side-slip and yaw.
+    pub lateral_grip: f32,
+    /// Brush-anchor stiffness (N per m of slip): the static grip spring that holds the tank at rest.
+    pub brush_stiffness: f32,
+    /// Brush-anchor damping (N·s/m): settles the hold spring without buzzing at rest.
+    pub brush_damping: f32,
+}
+
+impl Default for Drivetrain {
+    fn default() -> Self {
+        Self {
+            max_thrust: 12_500.0,
+            rolling_resistance: 1_150.0,
+            lateral_grip: 60_000.0,
+            brush_stiffness: 250_000.0,
+            brush_damping: 25_000.0,
+        }
+    }
+}
 
 pub fn plugin(app: &mut App) {
     app.init_resource::<DriveInput>()
-        .add_systems(Update, (attach_suspension, set_center_of_mass))
+        .register_type::<Drivetrain>()
+        .add_observer(attach_suspension)
+        .add_systems(Update, set_center_of_mass)
         // Order matters within the fixed step: read input, settle springs (sets per-wheel load),
         // then drive (reads that load for the friction circle). All gated by the gameplay set.
         .add_systems(
@@ -49,7 +87,9 @@ fn set_center_of_mass(
     tank: Query<(Entity, &GlobalTransform), (With<Tank>, Without<CenterOfMass>)>,
     anchor: Query<&GlobalTransform, With<CenterOfMassAnchor>>,
 ) {
-    let Ok((entity, tank_transform)) = tank.single() else { return };
+    let Ok((entity, tank_transform)) = tank.single() else {
+        return;
+    };
     let Ok(anchor) = anchor.single() else { return }; // empty not bound yet
 
     // The anchor's position in the tank's local frame is exactly Avian's COM offset.
@@ -70,13 +110,14 @@ pub struct Suspension {
     pub load: f32,
     /// Horizontal ground force applied this tick (thrust + friction), kept for the debug viz.
     pub drive_force: Vec3,
+    /// Brush-anchor: the world point the contact "gripped" while near rest. `Some` = gripping
+    /// (static friction holds the tank here); `None` = slipping (kinetic) or airborne.
+    pub anchor: Option<Vec3>,
 }
 
-/// Attach `Suspension` reactively once the rig binds a `Roadwheel` (init, ungated).
-fn attach_suspension(wheels: Query<Entity, Added<Roadwheel>>, mut commands: Commands) {
-    for entity in &wheels {
-        commands.entity(entity).insert(Suspension::default());
-    }
+/// Attach `Suspension` the moment the rig binds a `Roadwheel` (observer, ungated).
+fn attach_suspension(add: On<Add, Roadwheel>, mut commands: Commands) {
+    commands.entity(add.entity).insert(Suspension::default());
 }
 
 /// Damped-spring suspension: each grounded wheel pushes the hull up at its contact point, so
@@ -85,7 +126,9 @@ fn apply_suspension(
     mut body: Query<Forces, With<Tank>>,
     mut wheels: Query<(&RayCaster, &RayHits, &mut Suspension), With<Roadwheel>>,
 ) {
-    let Ok(mut forces) = body.single_mut() else { return };
+    let Ok(mut forces) = body.single_mut() else {
+        return;
+    };
 
     for (ray, hits, mut suspension) in &mut wheels {
         let Some(hit) = hits.iter_sorted().next() else {
@@ -122,8 +165,14 @@ struct DriveInput {
     steer: f32,
 }
 
-fn read_drive_input(keys: Res<ButtonInput<KeyCode>>, time: Res<Time>, mut input: ResMut<DriveInput>) {
-    let axis = |pos: KeyCode, neg: KeyCode| keys.pressed(pos) as i8 as f32 - keys.pressed(neg) as i8 as f32;
+fn read_drive_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    mut input: ResMut<DriveInput>,
+) {
+    let axis = |pos: KeyCode, neg: KeyCode| {
+        keys.pressed(pos) as i8 as f32 - keys.pressed(neg) as i8 as f32
+    };
     let target_throttle = axis(KeyCode::KeyW, KeyCode::KeyS);
     let target_steer = axis(KeyCode::KeyD, KeyCode::KeyA);
     let step = INPUT_RAMP * time.delta_secs();
@@ -147,10 +196,21 @@ fn approach(current: f32, target: f32, step: f32) -> f32 {
 /// the turn.
 fn apply_drive(
     input: Res<DriveInput>,
+    drivetrain: Option<Single<&Drivetrain>>,
     mut body: Query<(&GlobalTransform, Forces), With<Tank>>,
     mut wheels: Query<(&Roadwheel, &mut Suspension)>,
 ) {
-    let Ok((tank_transform, mut forces)) = body.single_mut() else { return };
+    let Ok((tank_transform, mut forces)) = body.single_mut() else {
+        return;
+    };
+
+    // The model authors `Drivetrain` on its part (the hull); fall back to the code default until it
+    // does (or if a variant omits it). Read by type — where it sits in the rig is irrelevant here.
+    let default = Drivetrain::default();
+    let drivetrain = match drivetrain {
+        Some(d) => d.into_inner(),
+        None => &default,
+    };
 
     // Ground-plane drive basis from the hull orientation: forward flattened onto the ground,
     // and right as forward rotated −90° about Y (avoids depending on a separate `right()`).
@@ -164,6 +224,7 @@ fn apply_drive(
         };
         if load <= 0.0 {
             suspension.drive_force = Vec3::ZERO;
+            suspension.anchor = None;
             continue;
         }
 
@@ -174,16 +235,62 @@ fn apply_drive(
             TrackSide::Right => input.throttle - input.steer,
         }
         .clamp(-1.0, 1.0);
+        let driving = command.abs() > COMMAND_DEADBAND;
 
         let velocity = forces.velocity_at_point(contact);
-        let f_long = command * MAX_THRUST - ROLLING_RESISTANCE * velocity.dot(forward);
-        let f_lat = -LATERAL_GRIP * velocity.dot(right);
-        let mut force = forward * f_long + right * f_lat;
+        let v_fwd = velocity.dot(forward);
+        let v_lat = velocity.dot(right);
 
-        // Friction circle: ground can't supply more than μ × load of tangential force.
+        // Static↔kinetic gate: below the stick speed the contact grips (plant an anchor and hold);
+        // above it, it slips and friction is the kinetic skid / coast-down model.
+        let gripping = v_fwd.hypot(v_lat) < STICK_SPEED;
+        if !gripping {
+            suspension.anchor = None;
+        } else if suspension.anchor.is_none() {
+            suspension.anchor = Some(contact);
+        }
+
+        // Slip from the planted anchor, split into the ground-plane axes.
+        let (d_fwd, d_lat) = match suspension.anchor {
+            Some(anchor) => (
+                (contact - anchor).dot(forward),
+                (contact - anchor).dot(right),
+            ),
+            None => (0.0, 0.0),
+        };
+
+        // Longitudinal: thrust when commanded (bleeding the anchor's forward slip so the static
+        // spring doesn't fight the drive — the wheel "rolls"); else hold (static spring) or, while
+        // still rolling, the engine-brake / coast-down.
+        let f_fwd = if driving {
+            if let Some(anchor) = suspension.anchor {
+                suspension.anchor = Some(anchor + forward * d_fwd);
+            }
+            command * drivetrain.max_thrust - drivetrain.rolling_resistance * v_fwd
+        } else if gripping {
+            -drivetrain.brush_stiffness * d_fwd - drivetrain.brush_damping * v_fwd
+        } else {
+            -drivetrain.rolling_resistance * v_fwd
+        };
+
+        // Lateral: static spring holds the tracks fixed at rest (kills sideways creep); kinetic
+        // stiff grip resists side-slip and yaw while moving (skid steer).
+        let f_lat = if gripping {
+            -drivetrain.brush_stiffness * d_lat - drivetrain.brush_damping * v_lat
+        } else {
+            -drivetrain.lateral_grip * v_lat
+        };
+
+        let mut force = forward * f_fwd + right * f_lat;
+
+        // Friction circle: ground can't supply more than μ × load of tangential force. Past it the
+        // grip breaks loose — re-plant the anchor at the contact so it re-grips from here.
         let grip = MU * load;
         if force.length() > grip {
-            force = force.normalize() * grip;
+            force = force.normalize_or_zero() * grip;
+            if suspension.anchor.is_some() {
+                suspension.anchor = Some(contact);
+            }
         }
 
         forces.apply_force_at_point(force, contact);

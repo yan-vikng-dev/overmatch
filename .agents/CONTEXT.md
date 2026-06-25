@@ -106,3 +106,29 @@ _Avoid_: pivot turn, neutral turn
 **Friction circle**:
 The shared grip budget at a contact station — longitudinal and lateral force together capped at μ × normal load.
 _Avoid_: friction ellipse
+
+**Grip anchor**:
+The world point a roadwheel's contact sticks to at rest; a brush spring pulls the contact back toward it (capped at the friction circle) to hold the tank statically. Planted when the contact slows past the stick speed, dropped when it breaks loose.
+_Avoid_: contact patch (that is the contact station)
+
+**Stick speed**:
+The contact speed below which a roadwheel grips — plants a grip anchor and holds with static friction — and above which it slips into kinetic friction. The static↔kinetic gate.
+
+**Hill-hold**:
+The tank holding station on a slope under its own grip anchors with no throttle — emergent static friction up to μ × load. Past that the slope wins and it slides.
+_Avoid_: handbrake (that is a separate, future input)
+
+**Engine-brake / coast-down**:
+The light longitudinal resistance applied when the throttle is released while the tank is still rolling — bleeds speed toward a stop before the grip anchors take over. The "heavy-glide" feel: how much momentum a released tank keeps.
+
+## Collision
+
+**Part layer**:
+One of the parallel concerns a rig part carries: its visual mesh, its collision proxy, its armor, its internal modules. Each is authored as child geometry/components of the part and queried independently, by type. The part is the unit; the layers compose on it.
+
+**Collision proxy**:
+A simplified convex shape standing in for a part's detailed mesh in the physics solver — authored on the model as a hidden collider mesh, never the render mesh. Coarse by design: only the outer convex envelope matters to collision.
+_Avoid_: collision mesh (suggests the full visual mesh)
+
+**Compound collider**:
+Several convex proxies on one rigid body that together approximate a concave shape (e.g. the stepped hull front as 2–3 pieces). The only way to represent concavity for a dynamic body, which cannot use a single concave collider.

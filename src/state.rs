@@ -86,7 +86,10 @@ fn spawn_pause_overlay(mut commands: Commands) {
         .with_children(|parent| {
             parent.spawn((
                 Text::new("PAUSED"),
-                TextFont { font_size: FontSize::Px(80.0), ..default() },
+                TextFont {
+                    font_size: FontSize::Px(80.0),
+                    ..default()
+                },
                 TextColor(Color::WHITE),
             ));
         });

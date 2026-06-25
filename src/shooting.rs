@@ -1,9 +1,13 @@
-//! Firing: spawn a kinematic shell at the muzzle, integrate gravity, segment-test the ground,
-//! emit an `Impact`, and recoil the barrel. No physics engine yet — gravity is a constant
-//! acceleration and the ground is the y=0 plane.
+//! Firing: spawn a kinematic shell at the muzzle, integrate gravity, raycast the terrain along
+//! each step, emit an `Impact`, and recoil the barrel. Ballistics stay hand-integrated — we own
+//! the trajectory (muzzle velocity, gravity, later drag/penetration as data + rules); Avian only
+//! answers the impact query: what the segment hit, where, and the surface normal.
 
+use avian3d::prelude::{SpatialQuery, SpatialQueryFilter};
+use bevy::ecs::lifecycle::Add;
 use bevy::prelude::*;
 
+use crate::Layer;
 use crate::state::GameplaySet;
 use crate::tank::{GunBarrel, Muzzle};
 
@@ -48,14 +52,12 @@ struct Reload {
     remaining: f32,
 }
 
-/// A shell hit something — the seam Phase-2 penetration/armor and impact VFX hang off.
-/// Global event (the shell despawns), handled by the `on_impact` observer.
+/// A shell hit something — the seam Phase-2 penetration/armor and impact VFX hang off. The
+/// hit's normal and struck entity are available from the raycast; add them here when a feature
+/// needs them. Global event (the shell despawns), handled by the `on_impact` observer.
 #[derive(Event)]
 struct Impact {
     position: Vec3,
-    /// Surface normal at the hit. Unused yet — kept for impact VFX/decals and ricochet.
-    #[allow(dead_code)]
-    normal: Vec3,
 }
 
 /// Preloaded mesh+material for the debug impact marker, cloned per hit by `on_impact`.
@@ -69,8 +71,9 @@ pub fn plugin(app: &mut App) {
     app.insert_resource(Reload { remaining: 0.0 })
         .add_observer(on_impact)
         .add_systems(Startup, setup_assets)
-        // attach_recoil is init (reacts to the barrel binding), so it stays out of the set.
-        .add_systems(Update, (fire.in_set(GameplaySet), attach_recoil))
+        // attach_recoil reacts to the barrel binding (observer), so it stays out of the set.
+        .add_observer(attach_recoil)
+        .add_systems(Update, fire.in_set(GameplaySet))
         .add_systems(
             FixedUpdate,
             (integrate_projectiles, apply_recoil).in_set(GameplaySet),
@@ -94,16 +97,17 @@ fn setup_assets(
     });
 }
 
-/// Attach `Recoil` to the barrel once the rig binds `GunBarrel`, capturing its rest (battery)
-/// position from the Transform. Keeps recoil (a shooting concern) out of the tank rig code.
-fn attach_recoil(barrels: Query<(Entity, &Transform), Added<GunBarrel>>, mut commands: Commands) {
-    for (entity, transform) in &barrels {
-        commands.entity(entity).insert(Recoil {
-            rest: transform.translation,
-            offset: 0.0,
-            velocity: 0.0,
-        });
-    }
+/// Attach `Recoil` the moment the rig binds `GunBarrel`, capturing its rest (battery) position
+/// from the barrel's (parent-local) Transform. Keeps recoil (a shooting concern) out of the rig.
+fn attach_recoil(add: On<Add, GunBarrel>, barrels: Query<&Transform>, mut commands: Commands) {
+    let Ok(transform) = barrels.get(add.entity) else {
+        return;
+    };
+    commands.entity(add.entity).insert(Recoil {
+        rest: transform.translation,
+        offset: 0.0,
+        velocity: 0.0,
+    });
 }
 
 fn fire(
@@ -119,11 +123,15 @@ fn fire(
     if !mouse.just_pressed(MouseButton::Left) || reload.remaining > 0.0 {
         return;
     }
-    let Ok(muzzle) = muzzle.single() else { return; };
+    let Ok(muzzle) = muzzle.single() else {
+        return;
+    };
 
     // Spawn at the muzzle, pointing down the bore; velocity is the bore axis * muzzle speed.
     commands.spawn((
-        Projectile { velocity: muzzle.forward() * MUZZLE_SPEED },
+        Projectile {
+            velocity: muzzle.forward() * MUZZLE_SPEED,
+        },
         WorldAssetRoot(assets.scene.clone()),
         muzzle.compute_transform(),
     ));
@@ -137,22 +145,28 @@ fn fire(
 
 fn integrate_projectiles(
     mut projectiles: Query<(Entity, &mut Transform, &mut Projectile)>,
+    spatial: SpatialQuery,
     time: Res<Time>,
     mut commands: Commands,
 ) {
     let dt = time.delta_secs();
+    let filter = SpatialQueryFilter::from_mask(Layer::Terrain);
     for (entity, mut transform, mut projectile) in &mut projectiles {
         let prev = transform.translation;
         // Semi-implicit Euler: update velocity first, then position.
         projectile.velocity += GRAVITY * dt;
         transform.translation += projectile.velocity * dt;
 
-        // Ground hit on the segment just traversed (no point test — fast shells can't tunnel).
-        if transform.translation.y <= 0.0 {
-            let curr = transform.translation;
-            let t = (prev.y / (prev.y - curr.y)).clamp(0.0, 1.0);
-            let impact = prev.lerp(curr, t);
-            commands.trigger(Impact { position: impact, normal: Vec3::Y });
+        // Raycast the segment just traversed against the terrain (a ray of the step's length —
+        // fast shells can't tunnel). A hit stops the shell and emits the impact at the hit point.
+        let step = transform.translation - prev;
+        let Ok(direction) = Dir3::new(step) else {
+            continue;
+        };
+        if let Some(hit) = spatial.cast_ray(prev, direction, step.length(), true, &filter) {
+            commands.trigger(Impact {
+                position: prev + direction * hit.distance,
+            });
             commands.entity(entity).despawn();
         }
     }

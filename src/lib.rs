@@ -6,6 +6,7 @@
 
 use avian3d::prelude::{PhysicsInterpolationPlugin, PhysicsLayer, PhysicsPlugins};
 use bevy::prelude::*;
+use bevy_skein::SkeinPlugin;
 
 mod aim;
 mod camera;
@@ -39,6 +40,10 @@ impl Plugin for GamePlugin {
             // `interpolate_all` renders bodies at an interpolated pose between fixed steps, so
             // motion stays smooth when the display rate differs from the physics tick rate.
             PhysicsPlugins::default().set(PhysicsInterpolationPlugin::interpolate_all()),
+            // Skein: instantiate reflected components authored on the Blender model from glTF
+            // extras (ADR-0007). `default()` also serves the registry over BRP for the Blender
+            // addon — but only in dev builds; release loads a static glTF with no BRP server.
+            SkeinPlugin::default(),
             state::plugin,
             world::plugin,
             tank::plugin,
@@ -48,9 +53,13 @@ impl Plugin for GamePlugin {
             shooting::plugin,
         ));
 
-        // Dev-only physics visualization (collider/ray wireframes) + debug toggles (X = x-ray
-        // the tank so gizmos inside the model show through). Off in release builds.
+        // Dev-only physics visualization (collider/ray wireframes) + debug toggles. Off in release
+        // builds. (Skein's BRP endpoint for Blender authoring is added by `SkeinPlugin` itself,
+        // also dev-only — see above.)
         #[cfg(debug_assertions)]
-        app.add_plugins((avian3d::prelude::PhysicsDebugPlugin::default(), debug::plugin));
+        app.add_plugins((
+            avian3d::prelude::PhysicsDebugPlugin::default(),
+            debug::plugin,
+        ));
     }
 }

@@ -6,9 +6,17 @@ edition = "2024"
 [dependencies]
 bevy = { version = "0.19", features = ["debug"] }
 avian3d = "0.7"
+bevy_skein = "0.6"
 
 [profile.dev]
 opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# Optimized for distribution: strip symbols and shrink code size. These slow
+# down compile time (full recompile + LTO), which is fine for release bundles.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

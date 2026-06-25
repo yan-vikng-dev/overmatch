@@ -2,6 +2,7 @@
 //! The camera is also the aiming device, so look direction stays the player's — zoom only
 //! changes the orbit radius, which slides along the view axis and never moves the aim point.
 
+use avian3d::prelude::SpatialQuery;
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::prelude::*;
 
@@ -68,12 +69,16 @@ fn spawn_camera(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(10.0, 7.0, -7.0).looking_at(Vec3::new(10.0, 1.0, 5.0), Vec3::Y),
-        OrbitCamera { zoom: 0.0, target_zoom: 0.0 },
+        OrbitCamera {
+            zoom: 0.0,
+            target_zoom: 0.0,
+        },
     ));
 }
 
 fn orbit_camera(
     camera: Single<(&mut Transform, &mut OrbitCamera), With<Camera3d>>,
+    spatial: SpatialQuery,
     tank: Query<&Transform, (With<Tank>, Without<Camera3d>)>,
     pivot: Res<TurretPivot>,
     mouse_motion: Res<AccumulatedMouseMotion>,
@@ -87,15 +92,19 @@ fn orbit_camera(
     }
 
     let (mut transform, mut orbit) = camera.into_inner();
-    let (Some(turret_local), Ok(tank_transform)) = (pivot.0, tank.single()) else { return; };
+    let (Some(turret_local), Ok(tank_transform)) = (pivot.0, tank.single()) else {
+        return;
+    };
 
     // Free look: yaw/pitch read back from the current rotation, so no orientation state is
     // stored. Mouse delta is already per-frame — do NOT multiply by dt. Stop pitch just short
     // of vertical, where euler angles hit gimbal lock.
     const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.001;
+    const YAW_SENSITIVITY: f32 = 0.004;
+    const PITCH_SENSITIVITY: f32 = 0.003;
     let (yaw, pitch, _) = transform.rotation.to_euler(EulerRot::YXZ);
-    let yaw = yaw - mouse_motion.delta.x * 0.004;
-    let pitch = (pitch - mouse_motion.delta.y * 0.003).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    let yaw = yaw - mouse_motion.delta.x * YAW_SENSITIVITY;
+    let pitch = (pitch - mouse_motion.delta.y * PITCH_SENSITIVITY).clamp(-PITCH_LIMIT, PITCH_LIMIT);
     transform.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
 
     // Zoom: scroll sets a target the actual zoom eases toward, so chunky (device-dependent)
@@ -108,8 +117,11 @@ fn orbit_camera(
 
     // Orbit around the turret ring (root pose × captured offset), lifted a little. The camera sits
     // on the line through the pivot along its view axis; the ground ray pulls it in near terrain.
-    let pivot_point = tank_transform.transform_point(turret_local) + Vec3::Y * 2.5;
-    let distance = 18.0 + (5.0 - 18.0) * orbit.zoom;
+    const PIVOT_LIFT: f32 = 2.5;
+    const ORBIT_FAR: f32 = 18.0;
+    const ORBIT_NEAR: f32 = 5.0;
+    let pivot_point = tank_transform.transform_point(turret_local) + Vec3::Y * PIVOT_LIFT;
+    let distance = ORBIT_FAR + (ORBIT_NEAR - ORBIT_FAR) * orbit.zoom;
     let back_ray = Ray3d::new(pivot_point, -transform.forward());
-    transform.translation = back_ray.get_point(ground_distance(back_ray, distance));
+    transform.translation = back_ray.get_point(ground_distance(&spatial, back_ray, distance));
 }

@@ -3,10 +3,12 @@
 //! aim point is stored in the hull's local frame, so it rides with the tank (WW2: no gun
 //! stabilization). Storing it in world space instead would be the modern-stabilization split.
 
+use avian3d::prelude::SpatialQuery;
+use bevy::ecs::lifecycle::Add;
 use bevy::prelude::*;
 
 use crate::state::GameplaySet;
-use crate::tank::{Gun, Hull, Muzzle, Servo, Turret};
+use crate::tank::{Gun, Hull, Muzzle, ServoCommand, Turret};
 use crate::world::ground_distance;
 
 /// Maximum engagement range; rays that hit nothing fall back to a point this far out.
@@ -28,19 +30,17 @@ struct AimIndicator;
 
 pub fn plugin(app: &mut App) {
     app.add_systems(Startup, spawn_hud)
-        // Attach AimPoint to the turret once the rig binds it (init, so ungated).
-        .add_systems(Update, attach_aim_point)
+        // Attach AimPoint the moment the rig binds the Turret marker.
+        .add_observer(attach_aim_point)
         .add_systems(
             Update,
             (aim, update_bore_indicator, update_aim_indicator).in_set(GameplaySet),
         );
 }
 
-/// Reactively give the turret its `AimPoint` when the tank rig binds the `Turret` marker.
-fn attach_aim_point(turrets: Query<Entity, Added<Turret>>, mut commands: Commands) {
-    for entity in &turrets {
-        commands.entity(entity).insert(AimPoint(None));
-    }
+/// Reactively give the turret its `AimPoint` the moment the rig binds the `Turret` marker.
+fn attach_aim_point(add: On<Add, Turret>, mut commands: Commands) {
+    commands.entity(add.entity).insert(AimPoint(None));
 }
 
 fn spawn_hud(mut commands: Commands) {
@@ -94,11 +94,15 @@ fn spawn_hud(mut commands: Commands) {
 
 fn aim(
     mouse: Res<ButtonInput<MouseButton>>,
+    spatial: SpatialQuery,
     camera_query: Single<(&Camera, &GlobalTransform)>,
     window: Single<&Window>,
     hull: Query<&GlobalTransform, With<Hull>>,
-    mut turret: Query<(&GlobalTransform, &mut Servo, &mut AimPoint), (With<Turret>, Without<Gun>)>,
-    mut gun: Query<(&GlobalTransform, &mut Servo), (With<Gun>, Without<Turret>)>,
+    mut turret: Query<
+        (&GlobalTransform, &mut ServoCommand, &mut AimPoint),
+        (With<Turret>, Without<Gun>),
+    >,
+    mut gun: Query<(&GlobalTransform, &mut ServoCommand), (With<Gun>, Without<Turret>)>,
 ) {
     // Hold RMB to free-look: the camera still pans, but we stop committing aim, so the gun
     // and the locked aim point hold their hull-relative pose.
@@ -107,51 +111,80 @@ fn aim(
     }
 
     let (camera, cam_transform) = *camera_query;
-    let Ok(ray) = camera.viewport_to_world(cam_transform, window.size() / 2.0) else { return; };
+    let Ok(ray) = camera.viewport_to_world(cam_transform, window.size() / 2.0) else {
+        return;
+    };
 
     // Aim at the ground hit, or a far fallback when nothing is struck (sky / above horizon).
-    let point = ray.get_point(ground_distance(ray, MAX_RANGE));
+    let point = ray.get_point(ground_distance(&spatial, ray, MAX_RANGE));
 
     // Computed in the hull's local frame so aim stays correct wherever the tank sits/turns.
-    let Ok(hull) = hull.single() else { return; };
+    let Ok(hull) = hull.single() else {
+        return;
+    };
     let to_local = hull.affine().inverse();
 
     // Turret yaw + stash the committed point in hull-local space (rides with the hull).
-    if let Ok((turret_transform, mut servo, mut aim_point)) = turret.single_mut() {
+    if let Ok((turret_transform, mut command, mut aim_point)) = turret.single_mut() {
         let dir = to_local.transform_vector3(point - turret_transform.translation());
-        servo.target = (-dir.x).atan2(-dir.z);
+        command.target = (-dir.x).atan2(-dir.z);
         aim_point.0 = Some(to_local.transform_point3(point));
     }
 
     // Gun pitch.
-    if let Ok((gun_transform, mut servo)) = gun.single_mut() {
+    if let Ok((gun_transform, mut command)) = gun.single_mut() {
         let dir = to_local.transform_vector3(point - gun_transform.translation());
         let horizontal = (dir.x * dir.x + dir.z * dir.z).sqrt();
-        servo.target = dir.y.atan2(horizontal);
+        command.target = dir.y.atan2(horizontal);
+    }
+}
+
+/// Project `world_point` to the screen and place a HUD dot there (its top-left offset by
+/// `half_size` to centre the dot), hiding it when the point is off-screen or behind the camera.
+fn place_indicator(
+    node: &mut Node,
+    visibility: &mut Visibility,
+    camera: &Camera,
+    cam_transform: &GlobalTransform,
+    world_point: Vec3,
+    half_size: f32,
+) {
+    match camera.world_to_viewport(cam_transform, world_point) {
+        Ok(screen) => {
+            node.left = Val::Px(screen.x - half_size);
+            node.top = Val::Px(screen.y - half_size);
+            *visibility = Visibility::Visible;
+        }
+        Err(_) => *visibility = Visibility::Hidden,
     }
 }
 
 fn update_bore_indicator(
+    spatial: SpatialQuery,
     camera_query: Single<(&Camera, &GlobalTransform)>,
     muzzle: Query<&GlobalTransform, With<Muzzle>>,
     mut indicator: Query<(&mut Node, &mut Visibility), With<BoreIndicator>>,
 ) {
     let (camera, cam_transform) = *camera_query;
-    let Ok(muzzle) = muzzle.single() else { return; };
-    let Ok((mut node, mut visibility)) = indicator.single_mut() else { return; };
+    let Ok(muzzle) = muzzle.single() else {
+        return;
+    };
+    let Ok((mut node, mut visibility)) = indicator.single_mut() else {
+        return;
+    };
 
     // Where the barrel is actually pointing, capped exactly like the aim picker.
     let ray = Ray3d::new(muzzle.translation(), muzzle.forward());
-    let point = ray.get_point(ground_distance(ray, MAX_RANGE));
+    let point = ray.get_point(ground_distance(&spatial, ray, MAX_RANGE));
 
-    match camera.world_to_viewport(cam_transform, point) {
-        Ok(screen) => {
-            node.left = Val::Px(screen.x - 2.0);
-            node.top = Val::Px(screen.y - 2.0);
-            *visibility = Visibility::Visible;
-        }
-        Err(_) => *visibility = Visibility::Hidden,
-    }
+    place_indicator(
+        &mut node,
+        &mut visibility,
+        camera,
+        cam_transform,
+        point,
+        2.0,
+    );
 }
 
 fn update_aim_indicator(
@@ -162,7 +195,9 @@ fn update_aim_indicator(
     mut indicator: Query<(&mut Node, &mut Visibility), With<AimIndicator>>,
 ) {
     let (camera, cam_transform) = *camera_query;
-    let Ok((mut node, mut visibility)) = indicator.single_mut() else { return; };
+    let Ok((mut node, mut visibility)) = indicator.single_mut() else {
+        return;
+    };
 
     // Shown only during free-look (RMB held) — otherwise it coincides with the center reticle.
     if !mouse.pressed(MouseButton::Right) {
@@ -170,8 +205,12 @@ fn update_aim_indicator(
         return;
     }
 
-    let Ok(hull) = hull.single() else { return; };
-    let Ok(aim_point) = aim_point.single() else { return; };
+    let Ok(hull) = hull.single() else {
+        return;
+    };
+    let Ok(aim_point) = aim_point.single() else {
+        return;
+    };
 
     // No committed aim yet (before first aim, or free-look from frame one).
     let Some(local) = aim_point.0 else {
@@ -182,12 +221,12 @@ fn update_aim_indicator(
     // Hull-local -> world, so the dot rides with the hull (unstabilized WW2 behaviour).
     let world = hull.affine().transform_point3(local);
 
-    match camera.world_to_viewport(cam_transform, world) {
-        Ok(screen) => {
-            node.left = Val::Px(screen.x - 3.0);
-            node.top = Val::Px(screen.y - 3.0);
-            *visibility = Visibility::Visible;
-        }
-        Err(_) => *visibility = Visibility::Hidden,
-    }
+    place_indicator(
+        &mut node,
+        &mut visibility,
+        camera,
+        cam_transform,
+        world,
+        3.0,
+    );
 }

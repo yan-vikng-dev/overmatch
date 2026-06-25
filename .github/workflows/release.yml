@@ -1,0 +1,77 @@
+name: Release
+
+# Tag-triggered release pipeline. Cut a release by bumping `version` in
+# Cargo.toml, then: git tag vX.Y.Z && git push --tags
+# A matching `vX.Y.Z` tag builds every platform and publishes a GitHub Release
+# with per-platform archives (binary + runtime assets).
+#
+# Phase 1 (now): publish to GitHub Releases.
+# Phase 2 (later): the same matrix output feeds Steam via SteamPipe.
+# macOS builds are currently UNSIGNED; signing/notarization is a follow-up.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'      # stable, e.g. v0.1.0
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'    # prerelease, e.g. v0.1.0-rc.1
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  upload-assets:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux build dependencies
+        if: contains(matrix.target, 'linux')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev libx11-dev
+
+      # Ship only runtime assets: the game loads .glb meshes; Blender source
+      # files are build-time only. (.blend1 is gitignored, but prune defensively.)
+      - name: Prune non-runtime assets
+        shell: bash
+        run: find assets -type f \( -name '*.blend' -o -name '*.blend1' \) -delete
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: overmatch
+          target: ${{ matrix.target }}
+          # e.g. overmatch-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+          archive: $bin-$tag-$target
+          # Bundle the assets/ folder next to the binary, under a top-level dir
+          # so users extract a single self-contained folder.
+          include: assets
+          leading-dir: true
+          tar: unix
+          zip: windows
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}

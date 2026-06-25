@@ -18,11 +18,15 @@ const FORCE_VIZ_SCALE: f32 = 1.0 / 20_000.0;
 
 pub fn plugin(app: &mut App) {
     app.init_resource::<XRay>()
-        .insert_resource(ShowGizmos(true))
+        // Off by default, like the x-ray — press G to bring all debug gizmos up.
+        .insert_resource(ShowGizmos(false))
         .add_systems(Startup, configure_physics_gizmos)
         .add_systems(Update, (toggle_xray, toggle_camera_follow, toggle_gizmos))
         // Mirror the on/off state onto Avian's own gizmos (colliders, suspension rays).
-        .add_systems(Update, sync_avian_gizmos.run_if(resource_changed::<ShowGizmos>))
+        .add_systems(
+            Update,
+            sync_avian_gizmos.run_if(resource_changed::<ShowGizmos>),
+        )
         // Draw after propagation so the arrows anchor to the tank's *interpolated* pose and stay
         // glued to the rendered wheels, instead of stepping at the physics tick rate.
         .add_systems(
@@ -72,13 +76,17 @@ fn toggle_camera_follow(keys: Res<ButtonInput<KeyCode>>, mut follow: ResMut<Came
 /// length is proportional to force — a live load/traction readout.
 fn draw_wheel_forces(wheels: Query<(&GlobalTransform, &Suspension)>, mut gizmos: Gizmos) {
     for (transform, suspension) in &wheels {
-        // Ground point under the interpolated hub (flat ground → straight down to y = 0).
+        // The wheel's real ground contact (the ray's hit point); airborne wheels have none.
+        let Some(contact) = suspension.contact else {
+            continue;
+        };
         let hub = transform.translation();
-        let contact = Vec3::new(hub.x, 0.0, hub.z);
-        // Our synced replacement for Avian's physics-rate suspension ray.
+        // Our synced replacement for Avian's physics-rate suspension ray (hub → hit point).
         gizmos.line(hub, contact, Color::srgb(0.9, 0.2, 0.2));
         if suspension.load > 0.0 {
-            let tip = contact + Vec3::Y * (suspension.load * FORCE_VIZ_SCALE);
+            // Normal load along the (interpolated) hull-up suspension axis, not world up — so it
+            // leans with the hull on a slope. (Wheel nodes share the hull's orientation.)
+            let tip = contact + transform.up() * (suspension.load * FORCE_VIZ_SCALE);
             gizmos.arrow(contact, tip, Color::srgb(0.1, 0.9, 1.0));
         }
         if suspension.drive_force != Vec3::ZERO {
@@ -113,7 +121,9 @@ fn toggle_xray(
     // Walk the tank's mesh descendants and retint their (shared) materials. Mutating an asset
     // touches every entity using it, which is exactly what we want — the whole tank fades.
     for entity in children.iter_descendants(*tank) {
-        let Ok(handle) = mesh_mats.get(entity) else { continue };
+        let Ok(handle) = mesh_mats.get(entity) else {
+            continue;
+        };
         if let Some(mut material) = materials.get_mut(&handle.0) {
             material.base_color = material.base_color.with_alpha(alpha);
             material.alpha_mode = mode;
