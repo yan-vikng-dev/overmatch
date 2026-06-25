@@ -27,6 +27,9 @@ _Avoid_: using "target" for the aim point
 
 ## Tank rig
 
+**Rig contract**:
+The set of named nodes the model must provide for code to bind behaviour to — the required markers (`Hull`, `Turret`, `Gun`, `Gun_Barrel`, `Muzzle`, `Center_Of_Mass`), at least one collision proxy, and at least one roadwheel per side. Absence is a fatal authoring error caught at bind, not a runtime condition.
+
 **Hull**:
 The tank body — the chassis the turret sits on, and the frame all aim math is computed relative to.
 

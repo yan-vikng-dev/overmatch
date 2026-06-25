@@ -11,14 +11,6 @@ use serde::Deserialize;
 use crate::state::GameplaySet;
 use crate::tank::{CenterOfMassAnchor, Roadwheel, Tank, TrackSide};
 
-/// Suspension free length from the hub (m). Longer than the effective radius (~0.5166) so at rest
-/// the spring is compressed enough to carry the tank's weight at the authored ride height.
-const REST_LENGTH: f32 = 0.6;
-/// Spring stiffness per wheel (N/m): ~16 wheels × this × static compression ≈ the tank's weight.
-const STIFFNESS: f32 = 450_000.0;
-/// Suspension damping per wheel (N·s/m), ~0.6 of critical, so it settles without bouncing.
-const DAMPING: f32 = 50_000.0;
-
 /// Coulomb coefficient: each wheel's total ground force is capped at MU × load (friction circle).
 /// Per-environment (the track-vs-ground surface pair), not per-tank — destined for the terrain
 /// mechanic, not the model (ADR-0007, bucket 3).
@@ -36,9 +28,11 @@ const STICK_SPEED: f32 = 0.3;
 const COMMAND_DEADBAND: f32 = 0.02;
 
 /// Per-variant drivetrain characteristics — this tank's locomotion spec sheet, read by
-/// `apply_drive`. Authored in the tank's `.tank.ron` spec sheet (ADR-0010) and applied to the
-/// hull; the code `Default` is the fallback used until the asset loads (or if a variant omits it).
+/// `apply_drive`. Authored in the tank's `.tank.ron` spec sheet (ADR-0010); **required, with no
+/// default** — a competitive sim must never run on guessed stats, so a failed spec load is fatal
+/// (`report_failed_spec`) and a tank simply isn't driven until its `Drivetrain` has been applied.
 #[derive(Component, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Drivetrain {
     /// Max thrust per roadwheel at full throttle (N); ×16 wheels = total tractive force.
     pub max_thrust: f32,
@@ -53,16 +47,22 @@ pub struct Drivetrain {
     pub brush_damping: f32,
 }
 
-impl Default for Drivetrain {
-    fn default() -> Self {
-        Self {
-            max_thrust: 12_500.0,
-            rolling_resistance: 1_150.0,
-            lateral_grip: 60_000.0,
-            brush_stiffness: 250_000.0,
-            brush_damping: 25_000.0,
-        }
-    }
+/// Per-variant suspension characteristics, authored in the `.tank.ron` spec sheet (ADR-0010) and
+/// applied to the hull. Required, no default (ADR-0011): the tank has no suspension until applied.
+#[derive(Component, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuspensionParams {
+    /// How far a roadwheel's suspension ray reaches from the hub (m). Must exceed the effective
+    /// radius (~0.5166) so it finds the ground at rest, with margin for droop. Used when the ray is
+    /// built (`apply_tank_spec`), not per-step.
+    pub ray_length: f32,
+    /// Spring free length from the hub (m). Longer than the effective radius so at rest the spring
+    /// is compressed enough to carry the tank's weight at the authored ride height.
+    pub rest_length: f32,
+    /// Spring stiffness per wheel (N/m): ~16 wheels × this × static compression ≈ the tank's weight.
+    pub stiffness: f32,
+    /// Suspension damping per wheel (N·s/m), ~0.6 of critical, so it settles without bouncing.
+    pub damping: f32,
 }
 
 pub fn plugin(app: &mut App) {
@@ -122,10 +122,12 @@ fn attach_suspension(add: On<Add, Roadwheel>, mut commands: Commands) {
 /// Damped-spring suspension: each grounded wheel pushes the hull up at its contact point, so
 /// ride height, pitch, roll, and weight transfer all emerge from the per-wheel springs.
 fn apply_suspension(
-    mut body: Query<Forces, With<Tank>>,
+    // The `&SuspensionParams` gates the whole system: no suspension until the spec is applied to
+    // the hull (ADR-0011 — no default spring). Wheels likewise lack a `RayCaster` until then.
+    mut body: Query<(Forces, &SuspensionParams), With<Tank>>,
     mut wheels: Query<(&RayCaster, &RayHits, &mut Suspension), With<Roadwheel>>,
 ) {
-    let Ok(mut forces) = body.single_mut() else {
+    let Ok((mut forces, params)) = body.single_mut() else {
         return;
     };
 
@@ -135,7 +137,7 @@ fn apply_suspension(
             continue;
         };
 
-        let compression = REST_LENGTH - hit.distance;
+        let compression = params.rest_length - hit.distance;
         if compression <= 0.0 {
             *suspension = Suspension::default();
             continue;
@@ -148,7 +150,7 @@ fn apply_suspension(
         // Damped spring along the suspension axis. velocity_at_point gives the hull's speed at the
         // contact; its component along `up` is the compression rate (negative while settling).
         let spring_speed = forces.velocity_at_point(contact).dot(up);
-        let load = (STIFFNESS * compression - DAMPING * spring_speed).max(0.0);
+        let load = (params.stiffness * compression - params.damping * spring_speed).max(0.0);
 
         forces.apply_force_at_point(up * load, contact);
         suspension.contact = Some(contact);
@@ -203,13 +205,13 @@ fn apply_drive(
         return;
     };
 
-    // The model authors `Drivetrain` on its part (the hull); fall back to the code default until it
-    // does (or if a variant omits it). Read by type — where it sits in the rig is irrelevant here.
-    let default = Drivetrain::default();
-    let drivetrain = match drivetrain {
-        Some(d) => d.into_inner(),
-        None => &default,
+    // `Drivetrain` is required per-variant data with no fallback (ADR-0010): we never guess stats.
+    // It's absent only in the startup frames before the spec applies (a failed load is fatal — see
+    // `report_failed_spec`), so apply no drive until then. Read by type — its rig slot is irrelevant.
+    let Some(drivetrain) = drivetrain else {
+        return;
     };
+    let drivetrain = drivetrain.into_inner();
 
     // Ground-plane drive basis from the hull orientation: forward flattened onto the ground,
     // and right as forward rotated −90° about Y (avoids depending on a separate `right()`).

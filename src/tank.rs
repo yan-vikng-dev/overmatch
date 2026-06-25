@@ -2,25 +2,20 @@
 //! for the turret/gun, and the asset-load binding. The tank declares *structure*; features
 //! (aim, shooting) attach their own behavior to these markers reactively.
 
+use std::collections::HashSet;
+
 use avian3d::prelude::{
     ColliderConstructor, ColliderConstructorHierarchy, ColliderDensity, CollisionLayers, LayerMask,
     RayCaster, RigidBody, SpatialQueryFilter,
 };
+use bevy::asset::LoadState;
 use bevy::prelude::*;
 use bevy::world_serialization::WorldInstanceReady;
 use serde::Deserialize;
 
 use crate::Layer;
-use crate::spec::TankSpecHandle;
-use crate::state::GameplaySet;
-
-/// Uniform density of the hull collider (kg/m³): roughly Tiger-I mass at the authored collision
-/// proxy's volume. PLACEHOLDER — mass is per-variant data (bucket 2), a later migration.
-const HULL_DENSITY: f32 = 1850.0;
-
-/// How far a suspension ray reaches from the hub (metres). Must exceed the effective radius
-/// (~0.5166) so it finds the ground at rest, with margin for droop.
-const SUSPENSION_RAY_LENGTH: f32 = 0.85;
+use crate::spec::{TankSpec, TankSpecHandle};
+use crate::state::{AppState, GameplaySet};
 
 // --- Rig markers. Name = the structural contract between the model and the code. ---
 
@@ -99,6 +94,7 @@ pub enum Travel {
 /// **degrees** — the human-facing authoring unit; `drive_servos` converts to radians (the
 /// computed/runtime unit shared with `ServoCommand` and `ServoState`).
 #[derive(Component, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServoSpec {
     axis: Axis,
     /// Max slew speed, degrees/second.
@@ -126,35 +122,96 @@ pub struct ServoState {
 }
 
 pub fn plugin(app: &mut App) {
-    app.add_systems(Startup, spawn_tank)
+    app.add_systems(Startup, load_tank_spec)
+        .add_systems(
+            Update,
+            spawn_tank_when_loaded.run_if(in_state(AppState::Loading)),
+        )
         .add_systems(FixedUpdate, drive_servos.in_set(GameplaySet));
 }
 
-fn spawn_tank(mut commands: Commands, asset_server: Res<AssetServer>) {
-    commands
-        .spawn((
-            WorldAssetRoot(
-                asset_server.load(GltfAssetLabel::Scene(0).from_asset("tiger_1/tiger_1.glb")),
-            ),
-            // The variant spec sheet (thrust, servo speeds, …) rides alongside the geometry;
-            // `apply_tank_spec` applies it once both the asset and the rig are ready (ADR-0010).
-            TankSpecHandle(asset_server.load("tiger_1/tiger_1.tank.ron")),
-            Transform::from_xyz(10.0, 2.0, 5.0).with_rotation(Quat::from_rotation_z(0.7)),
-            // The hull is a dynamic rigid body — Avian owns its Transform (ADR-0005). Its collider
-            // comes from the model's `*_Collider` convex proxy, bound in on_tank_ready (ADR-0008).
-            Tank,
-            RigidBody::Dynamic,
-        ))
-        .observe(on_tank_ready);
+/// The tank's spec sheet is a *load dependency* (ADR-0011): we kick off its load up front and the
+/// tank scene is spawned only once it's ready, so the rig binds with its stats already in hand —
+/// no spec-less window. While it loads we sit in `AppState::Loading`.
+#[derive(Resource)]
+struct PendingTankSpec(Handle<TankSpec>);
+
+fn load_tank_spec(mut commands: Commands, asset_server: Res<AssetServer>) {
+    commands.insert_resource(PendingTankSpec(
+        asset_server.load("tiger_1/tiger_1.tank.ron"),
+    ));
 }
 
-/// Walk the loaded scene and bind structural markers + the turret/gun servos by node name.
+/// Once the spec has loaded, spawn the tank and enter `Playing`. A *failed* spec load is fatal
+/// here (no fallback stats, ADR-0011); a still-loading spec just waits another frame.
+fn spawn_tank_when_loaded(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    pending: Option<Res<PendingTankSpec>>,
+    mut next: ResMut<NextState<AppState>>,
+) {
+    let Some(pending) = pending else {
+        return;
+    };
+    match asset_server.load_state(&pending.0) {
+        LoadState::Loaded => {
+            commands
+                .spawn((
+                    WorldAssetRoot(
+                        asset_server
+                            .load(GltfAssetLabel::Scene(0).from_asset("tiger_1/tiger_1.glb")),
+                    ),
+                    TankSpecHandle(pending.0.clone()),
+                    Transform::from_xyz(10.0, 2.0, 5.0).with_rotation(Quat::from_rotation_z(0.7)),
+                    // The hull is a dynamic rigid body — Avian owns its Transform (ADR-0005); its
+                    // collider comes from the model's `*_Collider` proxy, bound in on_tank_ready.
+                    Tank,
+                    RigidBody::Dynamic,
+                ))
+                .observe(on_tank_ready);
+            commands.remove_resource::<PendingTankSpec>();
+            next.set(AppState::Playing);
+        }
+        LoadState::Failed(err) => {
+            error!("required tank spec sheet failed to load: {err}");
+            panic!("required tank spec sheet failed to load: {err}");
+        }
+        _ => {}
+    }
+}
+
+/// Walk the loaded scene and, in one pass, bind structural markers + apply the (already-loaded)
+/// per-variant spec to each part — servo configs, the suspension ray, the collider's density — and
+/// enforce the rig contract: every node the sim binds behaviour to must exist in the model.
+/// Missing structure is an authoring bug — fatal like a bad spec sheet (ADR-0010) — so we panic
+/// with the list of what's absent. This is where ADR-0002's "name = the contract" is *enforced*.
 fn on_tank_ready(
     ready: On<WorldInstanceReady>,
     mut commands: Commands,
     children: Query<&Children>,
     names: Query<&Name>,
+    handles: Query<&TankSpecHandle>,
+    specs: Res<Assets<TankSpec>>,
 ) {
+    // The spec is a load dependency of spawning (ADR-0011): the tank is spawned only once its
+    // `.tank.ron` has loaded, so it's guaranteed present here. Its absence would be a bug.
+    let spec = handles
+        .get(ready.entity)
+        .ok()
+        .and_then(|handle| specs.get(&handle.0))
+        .expect("tank spec must be loaded before the tank is spawned");
+
+    // Hull-level per-variant data (each rig marker below takes its own per-part config).
+    commands
+        .entity(ready.entity)
+        .insert((spec.drivetrain.clone(), spec.suspension.clone()));
+
+    // Record what the walk found, to check against the required contract afterwards.
+    let mut found: HashSet<&'static str> = HashSet::new();
+    let mut left_wheels = 0u32;
+    let mut right_wheels = 0u32;
+    let mut colliders = 0u32;
+
     for entity in children.iter_descendants(ready.entity) {
         // Most descendants are unnamed mesh nodes — skip them quietly.
         let Ok(name) = names.get(entity) else {
@@ -162,59 +219,96 @@ fn on_tank_ready(
         };
         let mut entity = commands.entity(entity);
         match name.as_str() {
-            // Servos: bind the marker + the command/state slots here (structure). The `ServoSpec`
-            // config (axis, speeds, travel) is per-variant data, applied from the `.tank.ron` spec
-            // sheet by `apply_tank_spec` (ADR-0010) — not authored in code.
+            // Servos: marker + command/state slots + the per-variant `ServoSpec` (axis, speeds,
+            // travel) from the spec sheet (ADR-0010) — never authored in code.
             "Turret" => {
-                entity.insert((Turret, ServoCommand::default(), ServoState::default()));
+                found.insert("Turret");
+                entity.insert((
+                    Turret,
+                    ServoCommand::default(),
+                    ServoState::default(),
+                    spec.turret.clone(),
+                ));
             }
             "Gun" => {
-                entity.insert((Gun, ServoCommand::default(), ServoState::default()));
+                found.insert("Gun");
+                entity.insert((
+                    Gun,
+                    ServoCommand::default(),
+                    ServoState::default(),
+                    spec.gun.clone(),
+                ));
             }
             "Hull" => {
+                found.insert("Hull");
                 entity.insert(Hull);
             }
             "Muzzle" => {
+                found.insert("Muzzle");
                 entity.insert(Muzzle);
             }
             "Gun_Barrel" => {
+                found.insert("Gun_Barrel");
                 entity.insert(GunBarrel);
             }
             "Center_Of_Mass" => {
+                found.insert("Center_Of_Mass");
                 entity.insert(CenterOfMassAnchor);
             }
-            // Roadwheels (Wheel_L_0.., Wheel_R_0..): each gets a downward suspension ray,
-            // filtered to Terrain so it skips the hull's own collider. The wheel node has
-            // identity rotation, so local -Y is the hull-down suspension axis.
+            // Roadwheels (Wheel_L_0.., Wheel_R_0..): tag the track side + a downward suspension ray
+            // sized by the variant's `ray_length`, filtered to Terrain so it skips the tank's own
+            // collider. The wheel node has identity rotation, so local −Y is the hull-down axis.
             s if s.starts_with("Wheel_") => {
                 let side = if s.starts_with("Wheel_L") {
+                    left_wheels += 1;
                     TrackSide::Left
                 } else {
+                    right_wheels += 1;
                     TrackSide::Right
                 };
                 entity.insert((
                     Roadwheel { side },
                     RayCaster::new(Vec3::ZERO, Dir3::NEG_Y)
-                        .with_max_distance(SUSPENSION_RAY_LENGTH)
+                        .with_max_distance(spec.suspension.ray_length)
                         .with_query_filter(SpatialQueryFilter::from_mask(Layer::Terrain)),
                 ));
             }
-            // Collision proxies (`*_Collider`, optionally split `_0/_1/...`): each becomes a
-            // convex-hull collider on the Vehicle layer — part of the compound rigid body — and is
-            // hidden, since it exists for physics, not rendering (ADR-0008). The glTF loader puts
-            // the mesh on a child primitive entity, so build over this node's descendants (the
-            // hierarchy constructor) rather than the node itself, which has no mesh handle.
+            // Collision proxies (`*_Collider`, optionally split `_0/_1/...`): a convex-hull collider
+            // on the Vehicle layer at the variant's density, hidden (it's physics, not rendering —
+            // ADR-0008). The glTF loader puts the mesh on a child primitive, so build over the
+            // node's descendants (the hierarchy constructor), not the node itself.
             s if s.contains("_Collider") => {
+                colliders += 1;
                 entity.insert((
                     ColliderConstructorHierarchy::new(ColliderConstructor::ConvexHullFromMesh)
                         .with_default_layers(CollisionLayers::new([Layer::Vehicle], LayerMask::ALL))
-                        .with_default_density(ColliderDensity(HULL_DENSITY)),
+                        .with_default_density(ColliderDensity(spec.hull_density)),
                     Visibility::Hidden,
                 ));
             }
             _ => {}
         }
     }
+
+    // Required singletons, plus ≥1 collider (else the body is massless → NaN) and ≥1 roadwheel per
+    // side (else a track has no support/thrust). A real Tiger has many wheels; the sim only needs
+    // one contact station per side to be non-degenerate, so the contract is per-side presence, not
+    // a fixed count (which varies per variant).
+    const REQUIRED: [&str; 6] = ["Hull", "Turret", "Gun", "Gun_Barrel", "Muzzle", "Center_Of_Mass"];
+    let mut missing: Vec<&str> = REQUIRED.iter().copied().filter(|n| !found.contains(n)).collect();
+    if colliders == 0 {
+        missing.push("*_Collider");
+    }
+    if left_wheels == 0 {
+        missing.push("Wheel_L*");
+    }
+    if right_wheels == 0 {
+        missing.push("Wheel_R*");
+    }
+    assert!(
+        missing.is_empty(),
+        "tank model is missing required rig nodes: {missing:?}"
+    );
 }
 
 fn drive_servos(
@@ -223,9 +317,9 @@ fn drive_servos(
 ) {
     let dt = time.delta_secs();
     for (mut transform, spec, command, mut state) in &mut q {
-        // `ServoSpec` authors angles in degrees (the human/skein unit); the runtime — the command,
-        // the state, and the slew maths below — is radians. Convert the spec's angular quantities
-        // once here, at the spec→runtime boundary.
+        // `ServoSpec` authors angles in degrees (the human authoring unit); the runtime — the
+        // command, the state, and the slew maths below — is radians. Convert the spec's angular
+        // quantities once here, at the spec→runtime boundary.
         let max_speed = spec.max_speed.to_radians();
         let accel = spec.accel.to_radians();
         let travel = match spec.travel {

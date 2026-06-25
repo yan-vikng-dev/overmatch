@@ -1,8 +1,10 @@
-// Tiger I per-variant spec sheet (ADR-0010). The model owns geometry + spatial anchors;
-// this file owns the tuning numbers. Edit + re-run (hot-reloadable); no recompile.
-//
-// Angles are in DEGREES (the authoring unit); `drive_servos` converts to radians.
+// Tiger I per-variant spec sheet (ADR-0010). The model owns geometry + spatial anchors; this file
+// owns the tuning numbers — all required, there are no code defaults (ADR-0011). Edit + re-run
+// (hot-reloadable); no recompile. Angles are in DEGREES (the authoring unit); `drive_servos`
+// converts to radians.
 TankSpec(
+    // Hull collider density (kg/m³) → the hull's mass at the convex proxy's volume (~Tiger-I mass).
+    hull_density: 1850.0,
     // Locomotion characteristics, read by `apply_drive`.
     drivetrain: (
         max_thrust: 12500.0,
@@ -10,6 +12,13 @@ TankSpec(
         lateral_grip: 60000.0,
         brush_stiffness: 250000.0,
         brush_damping: 25000.0,
+    ),
+    // Suspension: `ray_length` sizes each roadwheel's probe; the spring terms are the damped support.
+    suspension: (
+        ray_length: 0.85,
+        rest_length: 0.6,
+        stiffness: 450000.0,
+        damping: 50000.0,
     ),
     // Turret yaw servo: continuous traverse about the hull-up axis.
     turret: (
