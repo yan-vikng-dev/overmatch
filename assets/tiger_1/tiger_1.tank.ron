@@ -3,8 +3,13 @@
 // (hot-reloadable); no recompile. Angles are in DEGREES (the authoring unit); `drive_servos`
 // converts to radians.
 TankSpec(
-    // Hull collider density (kg/m³) → the hull's mass at the convex proxy's volume (~Tiger-I mass).
-    hull_density: 1850.0,
+    // Total mass (kg). The collision proxy is abstract and contributes NO mass (ADR-0011); this is
+    // the authored balance figure. ~46.5 t matches the current suspension tuning; the real Tiger I
+    // is ~57 t — raising it means scaling suspension stiffness/damping to hold ride height.
+    mass: 46500.0,
+    // Hull box full dimensions (x=width, y=height, z=length, metres), used ONLY to approximate the
+    // angular-inertia distribution at `mass` (not a collision shape). Tunable.
+    inertia_extents: (3.0, 2.0, 6.3),
     // Locomotion characteristics, read by `apply_drive`.
     drivetrain: (
         max_thrust: 12500.0,

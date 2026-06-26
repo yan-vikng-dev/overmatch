@@ -80,7 +80,9 @@ pub fn plugin(app: &mut App) {
 }
 
 /// Set the body's centre of mass from the authored `Center_Of_Mass` empty (the model owns it).
-/// Runs once: the `Without<CenterOfMass>` filter retires it after the override is inserted.
+/// `on_tank_ready` adds `NoAutoCenterOfMass`, so this authored value is the body's COM outright —
+/// the collision proxies' centroid does not dilute it (ADR-0011). Runs once: the
+/// `Without<CenterOfMass>` filter retires it after the override is inserted.
 fn set_center_of_mass(
     mut commands: Commands,
     tank: Query<(Entity, &GlobalTransform), (With<Tank>, Without<CenterOfMass>)>,

@@ -5,8 +5,9 @@
 use std::collections::HashSet;
 
 use avian3d::prelude::{
-    ColliderConstructor, ColliderConstructorHierarchy, ColliderDensity, CollisionLayers, LayerMask,
-    RayCaster, RigidBody, SpatialQueryFilter,
+    AngularInertia, ColliderConstructor, ColliderConstructorHierarchy, CollisionLayers, LayerMask,
+    Mass, NoAutoAngularInertia, NoAutoCenterOfMass, NoAutoMass, RayCaster, RigidBody,
+    SpatialQueryFilter,
 };
 use bevy::asset::LoadState;
 use bevy::prelude::*;
@@ -201,10 +202,21 @@ fn on_tank_ready(
         .and_then(|handle| specs.get(&handle.0))
         .expect("tank spec must be loaded before the tank is spawned");
 
-    // Hull-level per-variant data (each rig marker below takes its own per-part config).
-    commands
-        .entity(ready.entity)
-        .insert((spec.drivetrain.clone(), spec.suspension.clone()));
+    // Hull-level per-variant data. Mass properties are AUTHORED, never derived from the abstract
+    // collision proxy (ADR-0011): `NoAuto*` makes the proxy (and the future turret ramming collider)
+    // contribute zero mass — they are collision-only. Mass is the balance figure; angular inertia is
+    // a box of the authored extents at that mass (distribution only); the centre of mass is the
+    // authored `Center_Of_Mass` empty, applied authoritatively by `set_center_of_mass`.
+    let (ex, ey, ez) = spec.inertia_extents;
+    commands.entity(ready.entity).insert((
+        spec.drivetrain.clone(),
+        spec.suspension.clone(),
+        Mass(spec.mass),
+        AngularInertia::from_shape(&Cuboid::new(ex, ey, ez), spec.mass),
+        NoAutoMass,
+        NoAutoAngularInertia,
+        NoAutoCenterOfMass,
+    ));
 
     // Record what the walk found, to check against the required contract afterwards.
     let mut found: HashSet<&'static str> = HashSet::new();
@@ -274,15 +286,14 @@ fn on_tank_ready(
                 ));
             }
             // Collision proxies (`*_Collider`, optionally split `_0/_1/...`): a convex-hull collider
-            // on the Vehicle layer at the variant's density, hidden (it's physics, not rendering —
-            // ADR-0008). The glTF loader puts the mesh on a child primitive, so build over the
-            // node's descendants (the hierarchy constructor), not the node itself.
+            // on the Vehicle layer, hidden (it's physics, not rendering — ADR-0008). Collision-only:
+            // it contributes no mass (the hull authors its own, see above). The glTF loader puts the
+            // mesh on a child primitive, so build over the node's descendants, not the node itself.
             s if s.contains("_Collider") => {
                 colliders += 1;
                 entity.insert((
                     ColliderConstructorHierarchy::new(ColliderConstructor::ConvexHullFromMesh)
-                        .with_default_layers(CollisionLayers::new([Layer::Vehicle], LayerMask::ALL))
-                        .with_default_density(ColliderDensity(spec.hull_density)),
+                        .with_default_layers(CollisionLayers::new([Layer::Vehicle], LayerMask::ALL)),
                     Visibility::Hidden,
                 ));
             }

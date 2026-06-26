@@ -15,6 +15,12 @@ The spec is a **load dependency**, not a thing applied after the fact: the tank 
 - **Debug-only panic, release degrade (rejected for required data).** Tempting for crash-averse UX, but for a *required* invariant it just ships a broken (again, unfair) experience with no signal. Reserved only for genuinely optional/recoverable assets — of which there are none yet.
 - **Fail fast, all builds (chosen).** A panic with a precise message is debuggable from a player report; a silently-wrong tank is not. This is the idiomatic Rust stance: a violated invariant is a bug, not a recoverable runtime condition (`expect`-style), and a required in-repo asset that fails to load *is* a violated invariant.
 
+## Mass properties are authored, not derived from the collision proxy
+
+A corollary the same principle forces: the hull's **mass, centre of mass, and angular inertia are authored** (RON `mass` + `inertia_extents`, and the `Center_Of_Mass` empty), and the hull carries `NoAutoMass` / `NoAutoAngularInertia` / `NoAutoCenterOfMass`. The `*_Collider` proxies — and the future turret ramming collider — are therefore **collision-only** and contribute *zero* mass. The proxy is an abstract envelope; its volume and centroid must not silently set the tank's weight or balance.
+
+This surfaced a real latent bug: previously `CenterOfMass` was set on the (mass-less) hull root *without* `NoAutoCenterOfMass`. Avian's `ComputedCenterOfMass` is a strictly mass-weighted average, so the authored point had weight 0 and was ignored — the body's COM was the proxy *centroid* (measured ~17 cm above the authored point). Adding `NoAutoCenterOfMass` makes the authored COM authoritative (verified: computed COM now equals the empty exactly). Inertia is approximated as a box of the authored extents at the authored mass — distribution from the box, magnitude from the real mass — never from the proxy.
+
 ## Consequences
 
 - The "the model owns it" claims — COM ([[0005-raycast-roadwheel-locomotion]]), geometry ([[0008-collision-convex-proxies]]), the spec sheet ([[0010-per-variant-data-in-ron]]) — are now *enforced*, not merely intended.

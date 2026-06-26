@@ -1,7 +1,7 @@
 //! Per-variant spec sheets as RON data assets (ADR-0010). The Blender model owns geometry and
-//! spatial anchors; this owns the tuning numbers — hull density, drivetrain, suspension, servo
+//! spatial anchors; this owns the tuning numbers — mass + inertia, drivetrain, suspension, servo
 //! configs — that differ per tank variant. A `.tank.ron` file deserializes (via serde) straight
-//! into the same components the sim reads (`Drivetrain`, `SuspensionParams`, `ServoSpec`), so
+//! into the same components the sim reads (`Mass`, `Drivetrain`, `SuspensionParams`, `ServoSpec`), so
 //! values stay plain-text, git-diffable, and hot-reloadable, with no recompile and no Blender
 //! round-trip. There are **no code defaults** (ADR-0011): a competitive sim never runs on guessed
 //! stats, so a failed load is fatal. The spec is a *load dependency* — the tank is spawned only
@@ -20,7 +20,10 @@ use crate::tank::{ServoSpec, Tank};
 #[derive(Asset, TypePath, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TankSpec {
-    pub hull_density: f32,
+    /// Total mass (kg) — authored balance data; the collision proxy contributes none (ADR-0011).
+    pub mass: f32,
+    /// Hull box full dimensions (x, y, z metres) approximating the angular-inertia distribution.
+    pub inertia_extents: (f32, f32, f32),
     pub drivetrain: Drivetrain,
     pub suspension: SuspensionParams,
     pub turret: ServoSpec,
@@ -93,7 +96,8 @@ mod tests {
             ron::de::from_str(ron).expect("tiger_1.tank.ron must deserialize into TankSpec");
         // Spot-check values across sections so the test exercises real field wiring, not just "it
         // parsed".
-        assert_eq!(spec.hull_density, 1850.0);
+        assert_eq!(spec.mass, 46500.0);
+        assert_eq!(spec.inertia_extents, (3.0, 2.0, 6.3));
         assert_eq!(spec.drivetrain.max_thrust, 12500.0);
         assert_eq!(spec.suspension.stiffness, 450_000.0);
     }
