@@ -86,11 +86,9 @@ fn setup_assets(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // Preload once; firing clones the handle rather than hitting the asset server per shot.
     commands.insert_resource(ProjectileAssets {
         scene: asset_server.load(GltfAssetLabel::Scene(0).from_asset("shell/shell.glb")),
     });
-    // Small red sphere reused for every impact marker.
     commands.insert_resource(ImpactDebug {
         mesh: meshes.add(Sphere::new(0.2)),
         material: materials.add(Color::srgb(1.0, 0.3, 0.1)),
@@ -127,7 +125,6 @@ fn fire(
         return;
     };
 
-    // Spawn at the muzzle, pointing down the bore; velocity is the bore axis * muzzle speed.
     commands.spawn((
         Projectile {
             velocity: muzzle.forward() * MUZZLE_SPEED,
@@ -136,7 +133,6 @@ fn fire(
         muzzle.compute_transform(),
     ));
 
-    // Kick the barrel back; apply_recoil springs it home.
     if let Ok(mut recoil) = barrel.single_mut() {
         recoil.velocity += RECOIL_KICK;
     }
@@ -191,7 +187,6 @@ fn apply_recoil(mut barrel: Query<(&mut Transform, &mut Recoil)>, time: Res<Time
 
 fn on_impact(impact: On<Impact>, debug: Res<ImpactDebug>, mut commands: Commands) {
     info!("shell impact at {:?}", impact.position);
-    // Debug marker for now; Phase-2 penetration/armor and impact VFX hook in here.
     commands.spawn((
         Mesh3d(debug.mesh.clone()),
         MeshMaterial3d(debug.material.clone()),

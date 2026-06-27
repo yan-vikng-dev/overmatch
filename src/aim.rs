@@ -142,7 +142,6 @@ fn aim(
         aim_point.0 = Some(to_local.transform_point3(point));
     }
 
-    // Gun pitch.
     if let Ok((gun_transform, mut command)) = gun.single_mut() {
         let dir = to_local.transform_vector3(point - gun_transform.translation());
         let horizontal = (dir.x * dir.x + dir.z * dir.z).sqrt();
