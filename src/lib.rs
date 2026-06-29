@@ -8,11 +8,16 @@ use avian3d::prelude::{PhysicsInterpolationPlugin, PhysicsLayer, PhysicsPlugins}
 use bevy::prelude::*;
 
 mod aim;
+mod ballistics;
 mod branding;
 mod camera;
+pub(crate) mod damage;
 #[cfg(debug_assertions)]
 mod debug;
 mod driving;
+/// The armor ballistics sandbox (`bin/armor_sandbox`). Public so the binary can mount it; not part
+/// of `GamePlugin`.
+pub mod sandbox;
 mod shooting;
 mod sight;
 mod spec;
@@ -28,6 +33,9 @@ pub(crate) enum Layer {
     Default,
     Terrain,
     Vehicle,
+    /// Ballistic volumes (armor plates + modules): what the penetration march raycasts against,
+    /// distinct from `Vehicle` (the dynamic collision proxy). "Same geometry, two layers" (ADR-0008).
+    Armor,
 }
 
 /// Every gameplay feature, composed. Add to an `App` that already has the runtime plugins
@@ -54,6 +62,10 @@ impl Plugin for GamePlugin {
             aim::plugin,
             // `sight` owns the gunner-view toggle/mode that `camera` and `aim` branch on.
             sight::plugin,
+            // `ballistics` owns the shell trajectory + impact seam; `shooting` is the player's gun
+            // control that drives it (the sandbox drives the same `FireShell` from its camera).
+            ballistics::plugin,
+            damage::plugin,
             shooting::plugin,
         ));
 

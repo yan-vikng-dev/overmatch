@@ -1,22 +1,25 @@
-//! Firing: spawn a kinematic shell at the muzzle, integrate gravity, raycast the terrain along
-//! each step, emit an `Impact`, and recoil the barrel. Ballistics stay hand-integrated — we own
-//! the trajectory (muzzle velocity, gravity, later drag/penetration as data + rules); Avian only
-//! answers the impact query: what the segment hit, where, and the surface normal.
+//! The player's gun control: fire on click (raising a `ballistics::FireShell`), enforce the reload
+//! cooldown, and recoil the barrel. The trajectory itself lives in `ballistics` — this module owns
+//! only what makes it the *player's* gun. The armor sandbox drives the same `FireShell` from its
+//! free-fly camera instead.
 
-use avian3d::prelude::{SpatialQuery, SpatialQueryFilter};
 use bevy::ecs::lifecycle::Add;
 use bevy::prelude::*;
 
-use crate::Layer;
+use crate::ballistics::ComponentHealth;
+use crate::ballistics::FireShell;
+use crate::damage::{FunctionRole, TankKnockedOut, TankVolumes, function_disabled};
 use crate::state::GameplaySet;
-use crate::tank::{GunBarrel, Muzzle};
+use crate::tank::{GunBarrel, Muzzle, Tank};
 
 /// Muzzle velocity of the 88mm gun (m/s). The world is in meters, so this is literal.
 const MUZZLE_SPEED: f32 = 773.0;
+/// Shell calibre (m) — the 88. Drives overmatch in the penetration march.
+const CALIBER: f32 = 0.088;
+/// Projectile mass (kg) — the 88's PzGr 39 (~10.2 kg). Primary driver of penetration capability.
+const SHELL_MASS: f32 = 10.2;
 /// Reload cooldown before the gun can fire again (s). Placeholder — tune to the gun later.
 const RELOAD_SECS: f32 = 3.0;
-/// Gravity applied to shells each fixed tick (m/s²).
-const GRAVITY: Vec3 = Vec3::new(0.0, -9.81, 0.0);
 
 /// Backward impulse on firing (m/s along the bore). Higher = harder, longer kick.
 const RECOIL_KICK: f32 = 14.0;
@@ -24,12 +27,6 @@ const RECOIL_KICK: f32 = 14.0;
 const RECOIL_STIFFNESS: f32 = 90.0;
 /// Damping; slightly underdamped, so the barrel lumbers home with a small settle.
 const RECOIL_DAMPING: f32 = 14.0;
-
-/// A shell in flight. Kinematic — integrated by hand, no physics engine.
-#[derive(Component)]
-struct Projectile {
-    velocity: Vec3,
-}
 
 /// Procedural barrel recoil: a 1-DOF damped spring on the barrel. Firing kicks it back along
 /// the bore (+local Z); the spring returns it to battery. The translational cousin of `Servo`.
@@ -40,59 +37,18 @@ struct Recoil {
     velocity: f32,
 }
 
-/// Preloaded shell scene, cloned per shot rather than loaded each time.
-#[derive(Resource)]
-struct ProjectileAssets {
-    scene: Handle<WorldAsset>,
-}
-
 /// Gun reload cooldown: seconds remaining before the next shot. 0 = ready.
 #[derive(Resource)]
 struct Reload {
     remaining: f32,
 }
 
-/// A shell hit something — the seam Phase-2 penetration/armor and impact VFX hang off. The
-/// hit's normal and struck entity are available from the raycast; add them here when a feature
-/// needs them. Global event (the shell despawns), handled by the `on_impact` observer.
-#[derive(Event)]
-struct Impact {
-    position: Vec3,
-}
-
-/// Preloaded mesh+material for the debug impact marker, cloned per hit by `on_impact`.
-#[derive(Resource)]
-struct ImpactDebug {
-    mesh: Handle<Mesh>,
-    material: Handle<StandardMaterial>,
-}
-
 pub fn plugin(app: &mut App) {
     app.insert_resource(Reload { remaining: 0.0 })
-        .add_observer(on_impact)
-        .add_systems(Startup, setup_assets)
         // attach_recoil reacts to the barrel binding (observer), so it stays out of the set.
         .add_observer(attach_recoil)
         .add_systems(Update, fire.in_set(GameplaySet))
-        .add_systems(
-            FixedUpdate,
-            (integrate_projectiles, apply_recoil).in_set(GameplaySet),
-        );
-}
-
-fn setup_assets(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    commands.insert_resource(ProjectileAssets {
-        scene: asset_server.load(GltfAssetLabel::Scene(0).from_asset("shell/shell.glb")),
-    });
-    commands.insert_resource(ImpactDebug {
-        mesh: meshes.add(Sphere::new(0.2)),
-        material: materials.add(Color::srgb(1.0, 0.3, 0.1)),
-    });
+        .add_systems(FixedUpdate, apply_recoil.in_set(GameplaySet));
 }
 
 /// Attach `Recoil` the moment the rig binds `GunBarrel`, capturing its rest (battery) position
@@ -112,8 +68,9 @@ fn fire(
     mouse: Res<ButtonInput<MouseButton>>,
     time: Res<Time>,
     mut reload: ResMut<Reload>,
-    assets: Res<ProjectileAssets>,
     muzzle: Query<&GlobalTransform, With<Muzzle>>,
+    tank: Query<(Option<&TankVolumes>, Option<&TankKnockedOut>), With<Tank>>,
+    functions: Query<(&FunctionRole, &ComponentHealth)>,
     mut barrel: Query<&mut Recoil>,
     mut commands: Commands,
 ) {
@@ -124,48 +81,30 @@ fn fire(
     let Ok(muzzle) = muzzle.single() else {
         return;
     };
+    let Ok((tank_volumes, knocked_out)) = tank.single() else {
+        return;
+    };
+    if knocked_out.is_some()
+        || function_disabled(tank_volumes, FunctionRole::Breech, &functions)
+        || function_disabled(tank_volumes, FunctionRole::GunBarrel, &functions)
+    {
+        return;
+    }
 
-    commands.spawn((
-        Projectile {
-            velocity: muzzle.forward() * MUZZLE_SPEED,
-        },
-        WorldAssetRoot(assets.scene.clone()),
-        muzzle.compute_transform(),
-    ));
+    // Hand off to ballistics: fire down the bore at muzzle speed. The trajectory is its concern.
+    commands.trigger(FireShell {
+        origin: muzzle.translation(),
+        direction: muzzle.forward(),
+        speed: MUZZLE_SPEED,
+        caliber: CALIBER,
+        mass: SHELL_MASS,
+    });
 
+    // Kick the barrel back; apply_recoil springs it home.
     if let Ok(mut recoil) = barrel.single_mut() {
         recoil.velocity += RECOIL_KICK;
     }
     reload.remaining = RELOAD_SECS;
-}
-
-fn integrate_projectiles(
-    mut projectiles: Query<(Entity, &mut Transform, &mut Projectile)>,
-    spatial: SpatialQuery,
-    time: Res<Time>,
-    mut commands: Commands,
-) {
-    let dt = time.delta_secs();
-    let filter = SpatialQueryFilter::from_mask(Layer::Terrain);
-    for (entity, mut transform, mut projectile) in &mut projectiles {
-        let prev = transform.translation;
-        // Semi-implicit Euler: update velocity first, then position.
-        projectile.velocity += GRAVITY * dt;
-        transform.translation += projectile.velocity * dt;
-
-        // Raycast the segment just traversed against the terrain (a ray of the step's length —
-        // fast shells can't tunnel). A hit stops the shell and emits the impact at the hit point.
-        let step = transform.translation - prev;
-        let Ok(direction) = Dir3::new(step) else {
-            continue;
-        };
-        if let Some(hit) = spatial.cast_ray(prev, direction, step.length(), true, &filter) {
-            commands.trigger(Impact {
-                position: prev + direction * hit.distance,
-            });
-            commands.entity(entity).despawn();
-        }
-    }
 }
 
 fn apply_recoil(mut barrel: Query<(&mut Transform, &mut Recoil)>, time: Res<Time>) {
@@ -183,13 +122,4 @@ fn apply_recoil(mut barrel: Query<(&mut Transform, &mut Recoil)>, time: Res<Time
         // Recoil rides back along the bore (+local Z), measured from the rest position.
         transform.translation = recoil.rest + Vec3::Z * recoil.offset;
     }
-}
-
-fn on_impact(impact: On<Impact>, debug: Res<ImpactDebug>, mut commands: Commands) {
-    info!("shell impact at {:?}", impact.position);
-    commands.spawn((
-        Mesh3d(debug.mesh.clone()),
-        MeshMaterial3d(debug.material.clone()),
-        Transform::from_translation(impact.position),
-    ));
 }

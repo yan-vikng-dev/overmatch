@@ -127,7 +127,7 @@ The light longitudinal resistance applied when the throttle is released while th
 ## Collision
 
 **Part layer**:
-One of the parallel concerns a rig part carries: its visual mesh, its collision proxy, its armor, its internal modules. Each is authored as child geometry/components of the part and queried independently, by type. The part is the unit; the layers compose on it.
+One of the parallel concerns a rig part carries: its visual mesh, its collision proxy, and its ballistic volumes (armor and modules alike — see Armor & penetration). Each is authored as child geometry/components of the part and queried independently, by type. The part is the unit; the layers compose on it.
 
 **Collision proxy**:
 A simplified convex shape standing in for a part's detailed mesh in the physics solver — authored on the model as a hidden collider mesh, never the render mesh. Coarse by design: only the outer convex envelope matters to collision.
@@ -135,3 +135,47 @@ _Avoid_: collision mesh (suggests the full visual mesh)
 
 **Compound collider**:
 Several convex proxies on one rigid body that together approximate a concave shape (e.g. the stepped hull front as 2–3 pieces). The only way to represent concavity for a dynamic body, which cannot use a single concave collider.
+
+## Armor & penetration
+
+(Model: `.agents/docs/design/armor-penetration-and-damage.md`.)
+
+**Ballistic volume**:
+A watertight solid mesh plus a material that taxes a penetrator over the line-of-sight distance through it — the single primitive both armor and modules are. Read by the penetration raycast, not the physics solver, so it need not be convex (but must be manifold).
+_Avoid_: armor plate, module (those are roles layered on a ballistic volume, not the thing itself)
+
+**Module**:
+A ballistic volume that also carries a function and state (engine, ammunition, breech, optics, transmission). Loses capability when damaged; repairable (ammunition excepted). Crew are the other layered role.
+_Avoid_: component (use it loosely in prose, but the rig term is module)
+
+**Material factor**:
+The per-volume multiplier turning line-of-sight distance into penetration cost — high for dense armor steel, low for an engine block. Density/hardness expressed as one number.
+
+**Line-of-sight thickness**:
+The geometric distance a penetrator travels through a ballistic volume, entry face to exit face. Slope is captured by this length, not by a separate cosine term.
+_Avoid_: effective thickness (that is line-of-sight thickness × material factor — the cost)
+
+**Penetration capability**:
+The reference-millimetres of armor a shell can defeat at its *current* velocity — a derivative of velocity for a given shell, not a fixed stat.
+_Avoid_: penetration value, pen (it changes shot-to-shot as velocity bleeds)
+
+**Normalization**:
+The penetrator's path bending toward the surface normal as it enters a volume, shortening its line-of-sight path.
+
+**Ricochet**:
+Deflection off a too-steep face without entering — spawns a new path segment and bleeds velocity, no penetration. Suppressed by overmatch.
+
+**Overmatch**:
+When a shell's caliber greatly exceeds a volume's thickness along its normal, suppressing ricochet and slope. The game's namesake, but one modifier among many — not the centre of the model.
+
+**Spall** (exit cone):
+The fixed-shape cone of fragments thrown from a volume's exit face on perforation — dense on-axis, thinning with angle and distance — and the primary crew-killer. Each fragment is one HP unit that stops at the first volume it reaches.
+_Avoid_: spalling, fragmentation, frag (the noun is spall; the emitter is the exit cone)
+
+**Crew station**:
+A crew function — gunner (aim), loader (reload), driver (move), commander (view/command). Served by whichever living crewman holds it, and backfilled at degraded effectiveness by others, the commander being the universal backup.
+_Avoid_: crew slot, seat
+
+**Cookoff**:
+Detonation of an ammunition volume when its HP is depleted — instantly kills all crew. The one terminal, non-repairable event.
+_Avoid_: ammo rack explosion, detonation (reserve detonation for HE)

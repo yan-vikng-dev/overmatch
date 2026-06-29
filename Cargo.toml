@@ -2,6 +2,7 @@
 name = "overmatch"
 version = "0.2.1"
 edition = "2024"
+default-run = "overmatch"
 
 [dependencies]
 bevy = { version = "0.19", features = ["debug"] }

@@ -4,24 +4,27 @@
 // (hot-reloadable); no recompile. Angles are in DEGREES (the authoring unit); `drive_servos`
 // converts to radians.
 TankSpec(
-    mass: 57_000.0,
+    // Total mass (kg). The collision proxy is abstract and contributes NO mass (ADR-0011); this is
+    // the authored balance figure. ~46.5 t matches the current suspension tuning; the real Tiger I
+    // is ~57 t — raising it means scaling suspension stiffness/damping to hold ride height.
+    mass: 46500.0,
     // Hull box full dimensions (x=width, y=height, z=length, metres), used ONLY to approximate the
     // angular-inertia distribution at `mass` (not a collision shape). Tunable.
     inertia_extents: (3.0, 2.0, 6.3),
     // Locomotion characteristics, read by `apply_drive`.
     drivetrain: (
-        max_thrust: 12_500.0,
-        rolling_resistance: 1410.0,
-        lateral_grip: 73548.0,
-        brush_stiffness: 306452.0,
-        brush_damping: 30645.0,
+        max_thrust: 12500.0,
+        rolling_resistance: 1150.0,
+        lateral_grip: 60000.0,
+        brush_stiffness: 250000.0,
+        brush_damping: 25000.0,
     ),
-    // Per-wheel spring: `ray_length` sizes the probe; stiffness/damping support `mass` at ride height.
+    // Suspension: `ray_length` sizes each roadwheel's probe; the spring terms are the damped support.
     suspension: (
         ray_length: 0.85,
         rest_length: 0.6,
-        stiffness: 551613.0,
-        damping: 61290.0,
+        stiffness: 450000.0,
+        damping: 50000.0,
     ),
     // Turret yaw servo: continuous traverse about the hull-up axis. `accel` is kept close to the
     // gun's so traverse and elevation feel coherent under a single mouse motion (hot-reload to taste).
@@ -60,8 +63,10 @@ TankSpec(
         "Ballistic_Turret_Top":      (material_factor: 1000.0),
         "Ballistic_Turret_Bottom":   (material_factor: 1000.0),
         "Ballistic_Turret_Mask":     (material_factor: 1000.0),
+        // --- Gun mantlet armour (the barrel itself is now the single Ballistic_Gun_Barrel below) ---
         "Ballistic_Gun":             (material_factor: 1000.0),
         "Ballistic_Gun_Mask":        (material_factor: 1000.0),
+        // --- Roadwheel armour (interleaved steel discs → spaced armour; cost-only) ---
         "Ballistic_Wheel_L_0": (material_factor: 1000.0),
         "Ballistic_Wheel_L_1": (material_factor: 1000.0),
         "Ballistic_Wheel_L_2": (material_factor: 1000.0),
@@ -83,13 +88,13 @@ TankSpec(
         "Ballistic_Transmission":   (material_factor:  600.0, hp: 10.0, function: Transmission),
         "Ballistic_Breech":         (material_factor:  800.0, hp: 8.0, function: Breech),
         "Ballistic_Gun_Barrel":     (material_factor: 1000.0, hp: 8.0, function: GunBarrel),
-        // --- Crew
+        // --- Crew (soft; the kill currency — a tank dies at <2 living crew) ---
         "Ballistic_Commander":        (material_factor:   30.0, hp: 3.0, crew: Commander),
         "Ballistic_Gunner":           (material_factor:   30.0, hp: 3.0, crew: Gunner),
         "Ballistic_Loader":           (material_factor:   30.0, hp: 3.0, crew: Loader),
         "Ballistic_Driver":           (material_factor:   30.0, hp: 3.0, crew: Driver),
         "Ballistic_BowGunner":        (material_factor:   30.0, hp: 3.0, crew: BowGunner),
-        // --- Ammunition (ammo: true means cookoff when dead) ---
+        // --- Ammunition (HP→0 = cookoff; depletes as fired) ---
         "Ballistic_Ammo_L_0":              (material_factor:  200.0, hp: 2.0, ammo: true),
         "Ballistic_Ammo_L_1":              (material_factor:  200.0, hp: 2.0, ammo: true),
         "Ballistic_Ammo_R_0":              (material_factor:  200.0, hp: 2.0, ammo: true),

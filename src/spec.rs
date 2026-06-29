@@ -11,12 +11,42 @@ use bevy::asset::io::Reader;
 use bevy::asset::{AssetLoader, LoadContext, LoadState};
 use bevy::prelude::*;
 use serde::Deserialize;
+use std::collections::HashMap;
 
+use crate::damage::{CrewStation, FunctionRole};
 use crate::driving::{Drivetrain, SuspensionParams};
 use crate::tank::{ServoSpec, Tank};
 
 /// One tank variant's spec sheet — the typed contents of a `.tank.ron` file. Its fields *are* the
 /// components the sim consumes; `tank::apply_tank_spec` copies them onto the rig once ready.
+/// One ballistic volume's data, keyed by model node name in [`TankSpec::volumes`]. **Composition
+/// over a `kind` enum** (design `armor-penetration-and-damage.md` §2/§12): `material_factor` is the
+/// base every volume has (shell-resistance per metre), and optional facets layer roles on top:
+/// `hp` makes it damageable, `crew` makes it a crewman, `ammo` makes depletion cook off, and
+/// `function` marks a repairable capability. Never add a central `kind` enum; "is it crew?" means
+/// "does it have the crew facet?"
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeSpec {
+    /// Reference-mm of armour per metre of material — the shell-resistance cost, decoupled from role
+    /// (a steel barrel module carries the same factor as a steel plate).
+    pub material_factor: f32,
+    /// HP pool if damageable (module/crew/ammo); absent → pure armour, nothing to lose. The RON
+    /// enables `implicit_some`, so this is authored bare (`hp: 8.0`, not `hp: Some(8.0)`); omitting
+    /// it yields `None`. Future facets follow the same optional-field-per-facet shape.
+    #[serde(default)]
+    pub hp: Option<f32>,
+    /// Crew station served by this volume. Requires `hp`.
+    #[serde(default)]
+    pub crew: Option<CrewStation>,
+    /// Ammunition volume: HP depletion cooks off and kills all crew. Requires `hp`.
+    #[serde(default)]
+    pub ammo: bool,
+    /// Repairable capability served by this module. Function loss is derived from HP.
+    #[serde(default)]
+    pub function: Option<FunctionRole>,
+}
+
 #[derive(Asset, TypePath, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TankSpec {
@@ -28,6 +58,10 @@ pub struct TankSpec {
     pub suspension: SuspensionParams,
     pub turret: ServoSpec,
     pub gun: ServoSpec,
+    /// Ballistic volumes keyed by model node name — the **source of truth** for which nodes are
+    /// volumes and what they are (design §12). The march reads `material_factor`; `on_tank_ready`
+    /// layers components from the facets. The `Armor_/Module_/...` name prefix is documentation only.
+    pub volumes: HashMap<String, VolumeSpec>,
 }
 
 /// The handle to a tank's spec sheet, carried on its root entity so each tank knows its variant
@@ -96,9 +130,23 @@ mod tests {
             ron::de::from_str(ron).expect("tiger_1.tank.ron must deserialize into TankSpec");
         // Spot-check values across sections so the test exercises real field wiring, not just "it
         // parsed".
-        assert_eq!(spec.mass, 46500.0);
+        assert_eq!(spec.mass, 57000.0);
         assert_eq!(spec.inertia_extents, (3.0, 2.0, 6.3));
         assert_eq!(spec.drivetrain.max_thrust, 12500.0);
-        assert_eq!(spec.suspension.stiffness, 450_000.0);
+        assert_eq!(spec.suspension.stiffness, 551_613.0);
+        // Volumes: a steel-grade *module* (barrel) and a pure-armour plate (no hp) exercise the
+        // composition facet — material decoupled from role.
+        assert_eq!(spec.volumes["Ballistic_Gun_Barrel"].material_factor, 1000.0);
+        assert_eq!(spec.volumes["Ballistic_Gun_Barrel"].hp, Some(8.0));
+        assert_eq!(
+            spec.volumes["Ballistic_Gun_Barrel"].function,
+            Some(FunctionRole::GunBarrel)
+        );
+        assert_eq!(
+            spec.volumes["Ballistic_Commander"].crew,
+            Some(CrewStation::Commander)
+        );
+        assert!(spec.volumes["Ballistic_Ammo_L_0"].ammo);
+        assert_eq!(spec.volumes["Ballistic_Hull_UFP"].hp, None);
     }
 }

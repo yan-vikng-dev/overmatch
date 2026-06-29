@@ -2,7 +2,7 @@
 
 use avian3d::prelude::{Physics, PhysicsTime};
 use bevy::prelude::*;
-use bevy::window::{CursorGrabMode, CursorOptions};
+use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 /// Top-level app mode. `Loading` gates gameplay until required assets (e.g. the tank's spec
 /// sheet) have loaded, so nothing binds against a half-loaded world (ADR-0011). More variants
@@ -53,7 +53,13 @@ fn toggle_pause(
 
 /// Lock + hide the cursor on entering Playing — fires on the Loading→Playing transition (once
 /// assets are ready) as well as on unpause.
-fn grab_cursor(mut cursor: Single<&mut CursorOptions>) {
+fn grab_cursor(window: Single<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>) {
+    let (mut window, mut cursor) = window.into_inner();
+
+    // Re-center before locking so an unpause from a cursor outside the window gives ownership back
+    // to this window before mouse-look resumes.
+    let center = window.size() / 2.0;
+    window.set_cursor_position(Some(center));
     cursor.grab_mode = CursorGrabMode::Locked;
     cursor.visible = false;
 }

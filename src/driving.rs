@@ -8,6 +8,8 @@ use bevy::ecs::lifecycle::Add;
 use bevy::prelude::*;
 use serde::Deserialize;
 
+use crate::ballistics::ComponentHealth;
+use crate::damage::{FunctionRole, TankKnockedOut, TankVolumes, function_disabled};
 use crate::state::GameplaySet;
 use crate::tank::{CenterOfMassAnchor, Roadwheel, Tank, TrackSide};
 
@@ -200,12 +202,32 @@ fn approach(current: f32, target: f32, step: f32) -> f32 {
 fn apply_drive(
     input: Res<DriveInput>,
     drivetrain: Option<Single<&Drivetrain>>,
-    mut body: Query<(&GlobalTransform, Forces), With<Tank>>,
+    mut body: Query<
+        (
+            Entity,
+            &GlobalTransform,
+            Forces,
+            Option<&TankVolumes>,
+            Option<&TankKnockedOut>,
+        ),
+        With<Tank>,
+    >,
+    functions: Query<(&FunctionRole, &ComponentHealth)>,
     mut wheels: Query<(&Roadwheel, &mut Suspension)>,
 ) {
-    let Ok((tank_transform, mut forces)) = body.single_mut() else {
+    let Ok((_tank, tank_transform, mut forces, tank_volumes, knocked_out)) = body.single_mut()
+    else {
         return;
     };
+    if knocked_out.is_some()
+        || function_disabled(tank_volumes, FunctionRole::Engine, &functions)
+        || function_disabled(tank_volumes, FunctionRole::Transmission, &functions)
+    {
+        for (_, mut suspension) in &mut wheels {
+            suspension.drive_force = Vec3::ZERO;
+        }
+        return;
+    }
 
     // `Drivetrain` is required per-variant data with no fallback (ADR-0010): we never guess stats.
     // It's absent only in the startup frames before the spec applies (a failed load is fatal — see

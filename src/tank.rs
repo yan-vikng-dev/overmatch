@@ -15,6 +15,8 @@ use bevy::world_serialization::WorldInstanceReady;
 use serde::Deserialize;
 
 use crate::Layer;
+use crate::ballistics::{ArmorVolume, BallisticVolume, ComponentHealth, ComponentVolume};
+use crate::damage::{Ammo, VolumeOf};
 use crate::spec::{TankSpec, TankSpecHandle};
 use crate::state::{AppState, GameplaySet};
 
@@ -211,6 +213,7 @@ fn spawn_tank_when_loaded(
                     ),
                     TankSpecHandle(pending.0.clone()),
                     Transform::from_xyz(10.0, 2.0, 5.0).with_rotation(Quat::from_rotation_z(0.7)),
+                    Name::new("Tiger I"),
                     // The hull is a dynamic rigid body — Avian owns its Transform (ADR-0005); its
                     // collider comes from the model's `*_Collider` proxy, bound in on_tank_ready.
                     Tank,
@@ -233,7 +236,7 @@ fn spawn_tank_when_loaded(
 /// enforce the rig contract: every node the sim binds behaviour to must exist in the model.
 /// Missing structure is an authoring bug — fatal like a bad spec sheet (ADR-0010) — so we panic
 /// with the list of what's absent. This is where ADR-0002's "name = the contract" is *enforced*.
-fn on_tank_ready(
+pub fn on_tank_ready(
     ready: On<WorldInstanceReady>,
     mut commands: Commands,
     children: Query<&Children>,
@@ -271,6 +274,7 @@ fn on_tank_ready(
 
     // Record what the walk found, to check against the required contract afterwards.
     let mut found: HashSet<&'static str> = HashSet::new();
+    let mut bound_volumes: HashSet<String> = HashSet::new();
     let mut left_wheels = 0u32;
     let mut right_wheels = 0u32;
     let mut colliders = 0u32;
@@ -336,30 +340,83 @@ fn on_tank_ready(
                         .with_query_filter(SpatialQueryFilter::from_mask(Layer::Terrain)),
                 ));
             }
-            // Collision proxies (`*_Collider`, optionally split `_0/_1/...`): a convex-hull collider
-            // on the Vehicle layer, hidden (it's physics, not rendering — ADR-0008). Collision-only:
-            // it contributes no mass (the hull authors its own, see above). The glTF loader puts the
-            // mesh on a child primitive, so build over the node's descendants, not the node itself.
-            s if s.contains("_Collider") => {
+            // Collision proxies (`*_Collider` / `*_Collision`, optionally split `_0/_1/...`): a
+            // convex-hull collider on the Vehicle layer, hidden (it's physics, not rendering —
+            // ADR-0008). Collision-only: it contributes no mass (the hull authors its own, see above).
+            // The glTF loader puts the mesh on a child primitive, so build over the node's descendants.
+            s if s.starts_with("Collider_") => {
                 colliders += 1;
                 entity.insert((
                     ColliderConstructorHierarchy::new(ColliderConstructor::ConvexHullFromMesh)
-                        .with_default_layers(CollisionLayers::new([Layer::Vehicle], LayerMask::ALL)),
+                        .with_default_layers(CollisionLayers::new(
+                            [Layer::Vehicle],
+                            LayerMask::ALL,
+                        )),
                     Visibility::Hidden,
                 ));
             }
-            // Ballistic volumes (armor/modules/crew/ammo — see `.agents/docs/design/
-            // armor-penetration-and-damage.md`): watertight solids named by role prefix,
-            // parented to their rig part so they inherit its motion. They don't render — the
-            // ballistics march raycasts them, and the armor sandbox visualizes them itself — so
-            // hide them at bind, mirroring `*_Collider`. (The exporter includes them as mesh
-            // nodes despite `hide_render` in Blender, so this is the load-bearing hide.)
-            s if s.starts_with("Armor_")
-                || s.starts_with("Module_")
-                || s.starts_with("Crew_")
-                || s.starts_with("Ammo_") =>
-            {
-                entity.insert(Visibility::Hidden);
+            // Ballistic volumes — the spec's `volumes` map is the source of truth (design
+            // `armor-penetration-and-damage.md` §12; composition, not a `kind` enum): a node is a
+            // volume iff it's a key. `material_factor` (shell-resistance per metre) every volume has;
+            // optional `hp` makes it a damageable component. The `Armor_/Module_/...` prefix is
+            // documentation only, never parsed for behaviour — resistance and role both come from
+            // data, so a steel barrel module resists like steel yet still takes damage.
+            //
+            // Bound as a query-only trimesh collider on the `Armor` layer (watertight solids may be
+            // concave — fine for a raycast, unlike the dynamic physics proxy, ADR-0008) with NO
+            // collision response (`filters = NONE`), so it never perturbs the body. Hidden, like
+            // `*_Collider` — the march raycasts it and the sandbox visualizes it itself.
+            s if spec.volumes.contains_key(s) => {
+                let volume = &spec.volumes[s];
+                bound_volumes.insert(s.to_string());
+                entity.insert((
+                    Visibility::Hidden,
+                    ColliderConstructorHierarchy::new(ColliderConstructor::TrimeshFromMesh)
+                        .with_default_layers(CollisionLayers::new([Layer::Armor], LayerMask::NONE)),
+                    BallisticVolume {
+                        material_factor: volume.material_factor,
+                    },
+                    VolumeOf(ready.entity),
+                ));
+                assert!(
+                    volume.hp.is_some()
+                        || (volume.crew.is_none() && !volume.ammo && volume.function.is_none()),
+                    "tank volume `{s}` declares a consequence facet but has no hp"
+                );
+                if let Some(crew) = volume.crew {
+                    entity.insert(crew);
+                }
+                if volume.ammo {
+                    entity.insert(Ammo);
+                }
+                if let Some(function) = volume.function {
+                    entity.insert(function);
+                }
+                match volume.hp {
+                    // Damageable (module/crew/ammo): an HP pool the march depletes (transit/spall/
+                    // shock). The consequences of HP→0 (§§7–8) are a later increment.
+                    Some(hp) => {
+                        entity.insert((
+                            ComponentVolume,
+                            ComponentHealth {
+                                current: hp,
+                                max: hp,
+                            },
+                        ));
+                    }
+                    // Pure armour: resists + shadows spall, nothing to lose.
+                    None => {
+                        entity.insert(ArmorVolume);
+                    }
+                }
+            }
+            // Drift lint: a `Ballistic_*` node absent from the spec's `volumes` map — likely an
+            // authoring slip (forgot to declare it, or a rename diverged). Ignored, not bound.
+            s if s.starts_with("Ballistic_") => {
+                warn!(
+                    "node `{s}` is named like a ballistic volume but has no entry in the tank \
+                     spec's `volumes` map — ignoring (add it, or rename if it isn't one)"
+                );
             }
             _ => {}
         }
@@ -369,10 +426,21 @@ fn on_tank_ready(
     // side (else a track has no support/thrust). A real Tiger has many wheels; the sim only needs
     // one contact station per side to be non-degenerate, so the contract is per-side presence, not
     // a fixed count (which varies per variant).
-    const REQUIRED: [&str; 6] = ["Hull", "Turret", "Gun", "Gun_Barrel", "Muzzle", "Center_Of_Mass"];
-    let mut missing: Vec<&str> = REQUIRED.iter().copied().filter(|n| !found.contains(n)).collect();
+    const REQUIRED: [&str; 6] = [
+        "Hull",
+        "Turret",
+        "Gun",
+        "Gun_Barrel",
+        "Muzzle",
+        "Center_Of_Mass",
+    ];
+    let mut missing: Vec<&str> = REQUIRED
+        .iter()
+        .copied()
+        .filter(|n| !found.contains(n))
+        .collect();
     if colliders == 0 {
-        missing.push("*_Collider");
+        missing.push("*Collider_");
     }
     if left_wheels == 0 {
         missing.push("Wheel_L*");
@@ -383,6 +451,18 @@ fn on_tank_ready(
     assert!(
         missing.is_empty(),
         "tank model is missing required rig nodes: {missing:?}"
+    );
+
+    // The spec's `volumes` map is the model↔code contract: every declared volume must exist in the
+    // model (a missing one is an authoring bug — fatal like a missing rig node).
+    let missing_volumes: Vec<&String> = spec
+        .volumes
+        .keys()
+        .filter(|name| !bound_volumes.contains(*name))
+        .collect();
+    assert!(
+        missing_volumes.is_empty(),
+        "tank spec declares ballistic volumes with no matching model node: {missing_volumes:?}"
     );
 }
 

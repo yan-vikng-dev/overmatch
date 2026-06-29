@@ -89,7 +89,11 @@ pub fn plugin(app: &mut App) {
         .add_systems(Startup, spawn_intent_reticle)
         .add_systems(
             Update,
-            (toggle_sight, drive_gunner_aim.run_if(in_gunner), adjust_range.run_if(in_gunner))
+            (
+                toggle_sight,
+                drive_gunner_aim.run_if(in_gunner),
+                adjust_range.run_if(in_gunner),
+            )
                 .chain()
                 .in_set(GameplaySet),
         )
