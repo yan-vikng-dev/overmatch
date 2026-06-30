@@ -39,10 +39,14 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
-  # The heavy job: lints + tests, which for Bevy means a real compile.
+  # The heavy job: lints + tests. The cold compile is large — this crate's dev profile
+  # builds all dependencies at opt-level 3 (`[profile.dev.package."*"]` in Cargo.toml)
+  # for fast in-editor runtime, which is slow to compile from scratch. The first run
+  # populates the rust-cache; subsequent (warm) runs finish in a few minutes, so this
+  # generous ceiling really only covers the initial cold build.
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 50
     steps:
       # No LFS: clippy/test compile the code but never load the .glb assets, so the
       # pointer-file checkout is fine and faster. `persist-credentials: false` keeps
